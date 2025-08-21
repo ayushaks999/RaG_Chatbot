@@ -1,168 +1,289 @@
-# Agentic RAG — Multi-PDF RAG Chatbot
+# Agentic RAG — Multi‑PDF RAG Chatbot
 
-**Agentic RAG** converts a collection of PDFs into an interactive, retrieval-augmented chatbot. Users upload PDFs, ask questions, and receive streamed, provenance-backed answers. The system supports per-user persistence, active learning (feedback → reranker training), an optional visual reranker (ColPali/ColQwen), and web-search fallback.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) ![Python](https://img.shields.io/badge/python-3.8%2B-orange) ![Streamlit](https://img.shields.io/badge/streamlit-%3E%3D1.20-%23FF4B4B)
 
----
+> **Agentic RAG** is an advanced, production-ready Streamlit application for Retrieval-Augmented Generation (RAG) over multiple PDF documents. It supports multi-user authentication, persistent storage, active learning (feedback → incremental reranker training), optional multimodal ColPali/ColQwen hybrid reranking, streaming LLM output, and flexible deployment.
 
-## Quick links
-
-* **Project:** Agentic RAG Chatbot
-* **Main file:** `app.py`
 
 ---
 
-## Elevator pitch
+## 🚀 Highlights (at-a-glance)
 
-Agentic RAG is a Streamlit application that lets you interrogate sets of PDFs using a modern RAG pipeline: chunking → embedding → vector search → learned/visual reranking → LLM answer generation, with a feedback loop that enables iterative improvement of retrieval quality.
+* Upload many PDFs and ask natural-language questions about them.
+* Persistent multi-user accounts (SQLite) + per-user storage for files and models.
+* Chroma vector index for document retrieval (persisted per-user + file-hash keyed cache).
+* Optional OCR fallback for image-only PDF pages via Tesseract.
+* Optional ColPali / ColQwen page-image embeddings to hybrid re-rank visual pages.
 
----
-
-## Features
-
-* Multi-PDF ingestion with optional OCR for scanned pages
-* Token-/char-based chunking with overlap and cached embeddings
-* Per-user Chroma vector store and embedding cache
-* Learned reranker (scikit-learn SGDClassifier) with incremental training from user feedback
-* Optional ColPali/ColQwen image+text hybrid reranking for image-heavy PDFs
-* Streaming answer generation using Gemini (ChatGoogleGenerativeAI)
-* Web-search fallback via Tavily when document evidence is weak
-* Lightweight auth (username/password), per-user persistence (SQLite), and rate limiting
-* Exportable chat/feedback JSON and reranker model management
+* Active learning: quick feedback buttons (Relevant / Not relevant) which are stored and can be used to incrementally train a scikit-learn reranker (SGDClassifier).
+* Streaming answer generation (LLM streaming or chunked reveal) with confidence scoring of retrieved snippets.
+* Rate-limiting per-user, file sanitization, model upload management and download/export tools.
 
 ---
 
-## Quickstart (local)
+## 📁 Repository structure (logical)
+
+```
+/ (repo root)
+├─ app.py                     # Streamlit entrypoint (main app UI)
+├─ rag_core.py?               # (conceptual) RAG workflow & helper functions
+├─ requirements.txt           # python deps
+├─ Dockerfile                 # optional (example)
+├─ README.md                  # this file
+├─ LICENSE
+└─ storage/                   # runtime, environment-specific (STORAGE_ROOT)
+   └─ user_<id>/              # per-user files, models, embeddings cache
+```
+
+> Note: The provided code is a single-file Streamlit application that bundles the RAG workflow, persistence, UI and model helpers into `app.py` (split into Part 1 + Part 2 in your submission). You can extract helper modules if desired.
+
+---
+
+## ✅ Features (detailed)
+
+### Authentication & multi-user persistence
+
+* Register & login users (SQLite `users` table). Passwords are PBKDF2‑SHA256 hashed with a per-user salt.
+* Persisted chats (`chats` table) and feedback (`feedback` table) per-user.
+* Per-user file storage (`files` table) with sanitized filenames and file-hash based names.
+
+### Uploads & PDF ingestion
+
+* Upload multiple PDF files via Streamlit sidebar.
+* File size guard (env `AGENTIC_RAG_MAX_UPLOAD_BYTES`, default 10MB) to prevent excessive uploads.
+* PDF parsing via `PyPDF2`; if a page has no extractable text and Tesseract is available, OCR is attempted.
+* Text chunking with optional tiktoken-based token-safe chunking (if `tiktoken` installed) or character-based chunking fallback.
+
+### Vector index & retrieval
+
+* Chroma vector store created per-user+file-hash and optionally persisted to disk (Chroma `persist_directory` configured under `STORAGE_ROOT`).
+* Embedding provider: GoogleGenerativeAIEmbeddings (Gemini) by default, but code uses abstraction so alternative embedding models can be injected.
+* Retriever fetches `k` relevant chunks (configurable in the retriever call).
+
+### Reranking & Active Learning
+
+* Two-stage re-ranking:
+
+  1. Optional learned reranker (SGDClassifier) trained on saved `feedback` examples. Embeddings of snippets are cached and used as features.
+  2. Optional ColPali hybrid re-scoring that computes page-image similarity and blends it with existing scores (70% image sim + 30% text score by default).
+* Quick inline feedback buttons in the UI — every label is stored and can trigger incremental training.
+* Incremental training persists models under per-user `models/` dir; last trained model stored as `reranker_sgd.joblib`.
+
+### LLM orchestration & scoring
+
+* Uses `ChatGoogleGenerativeAI` (Gemini) as primary LLM and `GoogleGenerativeAIEmbeddings` for embeddings — set `GEMINI_API_KEY` via environment or Streamlit secrets.
+* Scoring nodes evaluate snippet-level relevance using the LLM (`score_snippets_node`) and aggregate confidence (`evaluate_node`). These confidence values can gate whether to answer or fallback to web search.
+* Streaming answer generation if the LLM supports streaming. Otherwise fallback to chunked reveal for better UX.
+
+### Web search fallback
+
+* Integrates Tavily search as an optional web augment (`TAVILY_API_KEY`) for queries where confidence is low.
+
+### Tools & utilities
+
+* Export chat history & feedback as JSON from the UI.
+* Upload / download reranker models for portability.
+* Simple per-minute rate limiter (configurable via `AGENTIC_RAG_RATE_LIMIT_N`).
+
+---
+
+## 🛠️ Prerequisites
+
+* Python 3.8+
+* A modern machine or cloud instance (if using ColPali/ColQwen, GPU is recommended)
+* Google Gemini API key (set `GEMINI_API_KEY`) if you plan to use the default LLM & embeddings.
+* Tavily API key (optional) for web search integration: set `TAVILY_API_KEY`.
+* Optional extras:
+
+  * `pytesseract` + `tesseract` binary for OCR fallbacks.
+  * `torch`, `pdf2image` and `colpali_engine` for ColPali/ColQwen image embeddings.
+  * `scikit-learn` + `joblib` to enable reranker training and model persistence.
+  * `tiktoken` for token-accurate chunking.
+
+---
+
+## ⚙️ Environment variables / .env
+
+Create a `.env` (or set environment variables) with at least:
+
+```
+GEMINI_API_KEY=your_gemini_key_here
+TAVILY_API_KEY=your_tavily_key_here
+AGENTIC_RAG_DB_PATH=/path/to/agentic_rag.db
+AGENTIC_RAG_STORAGE=/path/to/storage_root
+AGENTIC_RAG_MAX_UPLOAD_BYTES=10485760   # default 10 MB
+AGENTIC_RAG_RATE_LIMIT_N=30
+```
+
+> The app also reads Streamlit secrets (`st.secrets`) if present.
+
+---
+
+## 💻 Installation (local)
 
 ```bash
-# Create and activate venv
+# recommended: create venv
 python -m venv .venv
-source .venv/bin/activate  # or .venv\Scripts\activate on Windows
+source .venv/bin/activate      # mac / linux
+.venv\Scripts\activate       # windows
 
-# Install base requirements
 pip install -r requirements.txt
+# or install core deps manually
+pip install streamlit pyPDF2 chromadb google-generativeai langgraph langchain-community
+# optional:
+pip install scikit-learn joblib tiktoken pytesseract pdf2image torch
+```
 
-# Set required env vars (example)
-export GEMINI_API_KEY="your_gemini_api_key"
-export TAVILY_API_KEY="your_tavily_api_key"
+## ▶️ Running the app
 
-# Run the app
+```bash
 streamlit run app.py
 ```
 
-> On Windows use `set` instead of `export`, or place keys in a `.env` file.
+Open the URL printed by Streamlit (usually `http://localhost:8501`).
 
 ---
 
-## Environment variables
+## 🧭 Quickstart — Typical workflow
 
-* `GEMINI_API_KEY` — required (LLM + embeddings)
-* `TAVILY_API_KEY` — required (web-search fallback)
-* `AGENTIC_RAG_DB_PATH` — optional (default `/tmp/agentic_rag.db`)
-* `AGENTIC_RAG_STORAGE` — optional (default `/tmp/agentic_rag_storage`)
-* `AGENTIC_RAG_RATE_LIMIT_N` — optional (default `30`)
-* `AGENTIC_RAG_MAX_UPLOAD_BYTES` — optional (default `10485760` \~ 10 MB)
-
-Optional packages enable extra features:
-
-* `torch`, `colpali_engine`, `pdf2image` → ColPali visual reranking
-* `pytesseract` → OCR fallback
-* `scikit-learn`, `joblib` → reranker training and persistence
-* `tiktoken` → token-accurate chunking
+1. Start the app with `streamlit run app.py`.
+2. Register an account (sidebar) and Login.
+3. Upload one or more PDFs using the sidebar uploader.
+4. Ask a question in the main pane (or click *Summarize documents*).
+5. View streamed answer and the best retrieved snippet with provenance (filename / page / chunk).
+6. Use **Mark Relevant** or **Mark Not Relevant** to give feedback that improves the reranker over time.
+7. Optional: Upload a trained reranker model via the sidebar or let the app train one incrementally from feedback.
 
 ---
 
-## How it works — flow diagram
+## 🔁 Reranker training (incremental)
 
-The diagram below shows the high-level pipeline and feedback loop.
+* Feedback rows are stored in SQLite `feedback` table for each user.
+* `train_reranker_incremental(user_id)` will:
+
+  1. Load saved feedback rows for the user.
+  2. Embed snippet texts (cached under `STORAGE_ROOT/user_<id>/emb_cache/<file_hash>`).
+  3. Train or partial\_fit an `SGDClassifier` (log loss) and persist both a timestamped and stable file under `user_<id>/models/`.
+* UI exposes a **Train reranker from feedback** button to trigger this.
+
+---
+
+## 🖼️ ColPali / ColQwen hybrid reranking (experimental)
+
+* If `colpali_engine` + `torch` + `pdf2image` are installed, the app can compute page-image embeddings and cache them per-file + user.
+* The hybrid score blends image similarity (70%) with the text score (30%) to re-rank snippets where images matter (for diagrams, screenshots, forms).
+* Flag `Enable ColPali/ColQwen hybrid rerank` in the sidebar to attempt building the index (best-effort, cached).
+
+---
+
+## 🔒 Security & operational notes
+
+* Passwords are hashed with PBKDF2 + per-user salt (200,000 iterations).
+* Filenames are sanitized to avoid arbitrary path writes. File content is written only under `STORAGE_ROOT`.
+* Rate limiting prevents abuse (per minute). Set `AGENTIC_RAG_RATE_LIMIT_N` to tune.
+* Avoid running with `STORAGE_ROOT` on ephemeral container storage unless you accept that user data will be lost on restart; persist to a mounted volume when deploying.
+* If deploying publicly, secure the Streamlit instance (reverse proxy, TLS) and protect the DB file; consider adding OAuth for production-grade auth.
+
+---
+
+## 📈 Architecture / Workflow Diagram
+
+Below is a high-level mermaid workflow that matches the `StateGraph` pipeline in the code:
 
 ```mermaid
-graph TD
-    A(Start: User uploads PDF & asks question) --> B[initialize_models];
-    B --> C[load_pdf_text];
-    C --> D[chunk_text];
-    D --> E[create_chroma_index];
-    E --> F[retrieve];
+flowchart TD
+  A[Start: initialize_models] --> B[load_and_chunk_docs]
+  B --> C[create_chroma_index]
+  C --> D[retrieve]
+  D -->|question == "summarize"| M[summarize]
+  D -->|else| E[rerank]
+  E --> F[score_snippets]
+  F --> G[evaluate]
+  G -->|confidence >= 0.6| H[generate]
+  G -->|confidence < 0.6| I[web_search]
+  I --> H
+  H --> Z[END]
+  M --> Z
 
-    F --> G{route_after_retrieval};
-    G -- "Query is 'summarize'" --> H[summarize];
-    G -- "Normal question" --> I[evaluate];
-
-    I --> J{route_after_evaluation};
-    J -- "Confidence ≥ 0.6" --> K[generate];
-    J -- "Confidence < 0.6" --> L[web_search];
-
-    L --> K;
-
-    K --> M(End: Display Answer);
-    H --> M;
-
-    classDef start-end fill:#28a745,stroke:#333,stroke-width:2px,color:#fff;
-    classDef process fill:#007bff,stroke:#333,stroke-width:2px,color:#fff;
-    classDef decision fill:#ffc107,stroke:#333,stroke-width:2px,color:#000;
-    classDef special-path fill:#fd7e14,stroke:#333,stroke-width:2px,color:#fff;
-
-    class A,M start-end;
-    class B,C,D,E,F,I,K,L,H process;
-    class G,J decision;
+  subgraph Optional
+    I2[ColPali page_embeddings]
+    I2 --> E
+    J[Incremental reranker training] --> E
+  end
 ```
 
-> Note: Mermaid diagrams render on GitHub and many Markdown viewers that support Mermaid. If your viewer does not render Mermaid, the same flow can be interpreted from the plain sections below.
+> This mirrors the graph created by `workflow = StateGraph(State)` in the code and the conditional routing after retrieval and evaluation.
 
 ---
 
-## Components & files
+## 📌 UI Walkthrough & Controls
 
-* `app.py` — main Streamlit application and the StateGraph workflow
-* `requirements.txt` — (suggested) Python dependencies
-* `Dockerfile` — (optional) containerization
-* `storage/` — per-user files, embeddings, trained models (set via `AGENTIC_RAG_STORAGE`)
-* `agentic_rag.db` — SQLite DB (path controlled by `AGENTIC_RAG_DB_PATH`)
+**Sidebar**
 
----
+* Account: Register / Login (Confirm Auth)
+* Upload PDF(s) (accepts multiple files)
+* Model save dir
+* Reranker model upload / load / delete (if scikit-learn & joblib are installed)
+* Manual feedback expander (paste snippet + label)
+* Enable ColPali / ColQwen hybrid rerank toggle
+* Train reranker from feedback button
+* Summarize documents button
 
-## Architecture (textual)
+**Main pane**
 
-1. **Ingest**: PDF bytes → PyPDF2 extract\_text; fallback to `pdf2image+pytesseract` for scanned pages.
-2. **Chunk**: split pages into overlapping chunks using token-aware logic when `tiktoken` is available.
-3. **Embed**: use Gemini embeddings; cache per user/file in `.npy` files.
-4. **Index**: store embeddings in a Chroma index persisted per user+file.
-5. **Retrieve**: query the vector store to get candidate snippets.
-6. **Rerank**: apply learned reranker (if available) and optionally combine with ColPali visual similarity.
-7. **Score & Evaluate**: use the LLM to provide snippet-level confidence and aggregate into a global confidence score.
-8. **Answer**: If confident, generate answer using top snippets; otherwise, query web (Tavily) and synthesize answer.
-9. **Stream**: stream answer text to the UI. Show provenance and allow labeling.
-10. **Active learning**: store labels in SQLite and (optionally) incremental-train an SGD reranker using cached embeddings.
+* Left column: Chat history, exports, last trained reranker download
+* Right column: Ask question input, *Get Answer* button, streamed answer and provenance, feedback buttons per snippet
 
 ---
 
-## Security & production notes
+## 🧪 Troubleshooting & Tips
 
-* The included username/password auth uses PBKDF2 + salt, but is **not** production-grade. For production, prefer OAuth/OIDC (Google/GitHub).
-* Move secrets to a secrets manager and use HTTPS behind a reverse proxy.
-* Use a managed vector DB and production-grade DB (Postgres) if scaling beyond a few users.
-
----
-
-## Troubleshooting
-
-* **`GEMINI_API_KEY` missing**: the app will `st.error()` and stop — ensure env var is set.
-* **Large PDFs**: increase `AGENTIC_RAG_MAX_UPLOAD_BYTES` or preprocess PDFs to reduce size.
-* **ColPali failures**: ensure `torch` + `pdf2image` are installed and a GPU is available for best performance.
+* **LLM API key missing**: If `GEMINI_API_KEY` is not set you will see an error — set it in your environment or `st.secrets` and restart.
+* **Chroma errors**: Ensure Chroma / dependencies are installed; check filesystem permissions for the `STORAGE_ROOT` persist directory.
+* **Reranker not training**: Install `scikit-learn` and `joblib`; verify `feedback` table has rows for the user.
+* **OCR not working**: Install `tesseract` binary and `pytesseract`; make sure `pdf2image` is present.
+* **ColPali attempt fails**: This path is best-effort and will be disabled if `torch`/`colpali_engine` or `pdf2image` aren't available. GPU recommended for Col models.
 
 ---
 
-## Next steps / extras you can add
+## 🐳 Deployment examples
 
-* Replace built-in auth with Google OAuth2 for smoother login.
-* Wire the app to a managed vector DB (Pinecone/Chroma Cloud/Weaviate).
-* Add multi-snippet answer aggregation with explicit citations (e.g., `[1]`-style).
-* Add metrics dashboard for reranker quality, latency, and feedback counts.
+### Docker (simple)
+
+```dockerfile
+FROM python:3.10-slim
+WORKDIR /app
+COPY . /app
+RUN pip install -r requirements.txt
+ENV STREAMLIT_SERVER_HEADLESS=true
+CMD ["streamlit", "run", "app.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
+```
+
+Mount a host directory for `STORAGE_ROOT` and expose port 8501. Provide your `.env` via Docker secrets or env vars.
 
 ---
 
-## License
+## 🤝 Contributing
 
-MIT
+Contributions are welcome. Suggested improvements:
+
+* Extracting `app.py` into modular packages (`ingest`, `indexing`, `ui`, `auth`).
+* Add OAuth2 / Google sign-in for production authentication.
+* Add tests for DB migrations and node functions.
+* Add a Helm chart / k8s example for production deployment.
 
 ---
 
+## 📝 License
+
+This project is provided under the **MIT License**. See `LICENSE` for details.
+
+---
+
+## 📬 Questions, edits or customizations
+
+If you want the README tailored differently (shorter, more visuals, adding deployment scripts, or a GitHub Actions CI), tell me which focus you prefer and I will update the document.
+
+---
+
+*Generated for: Agentic RAG Chatbot — combined parts (PDF ingestion, RAG pipeline, persistence & UI)*
