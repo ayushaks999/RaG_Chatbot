@@ -19,13 +19,6 @@
 * Streaming answer generation (LLM streaming or chunked reveal) with confidence scoring of retrieved snippets.
 * Rate-limiting per-user, file sanitization, model upload management and download/export tools.
 
----
-
-
-
-> Note: The provided code is a single-file Streamlit application that bundles the RAG workflow, persistence, UI and model helpers into `app.py` (split into Part 1 + Part 2 in your submission). You can extract helper modules if desired.
-
----
 
 ## ✅ Features (detailed)
 
