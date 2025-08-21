@@ -21,19 +21,7 @@
 
 ---
 
-## 📁 Repository structure (logical)
 
-```
-/ (repo root)
-├─ app.py                     # Streamlit entrypoint (main app UI)
-├─ rag_core.py?               # (conceptual) RAG workflow & helper functions
-├─ requirements.txt           # python deps
-├─ Dockerfile                 # optional (example)
-├─ README.md                  # this file
-├─ LICENSE
-└─ storage/                   # runtime, environment-specific (STORAGE_ROOT)
-   └─ user_<id>/              # per-user files, models, embeddings cache
-```
 
 > Note: The provided code is a single-file Streamlit application that bundles the RAG workflow, persistence, UI and model helpers into `app.py` (split into Part 1 + Part 2 in your submission). You can extract helper modules if desired.
 
@@ -195,7 +183,7 @@ flowchart TD
   A[Start: initialize_models] --> B[load_and_chunk_docs]
   B --> C[create_chroma_index]
   C --> D[retrieve]
-  D -->|question == "summarize"| M[summarize]
+  D -->|question == summarize| M[summarize]
   D -->|else| E[rerank]
   E --> F[score_snippets]
   F --> G[evaluate]
@@ -206,8 +194,7 @@ flowchart TD
   M --> Z
 
   subgraph Optional
-    I2[ColPali page_embeddings]
-    I2 --> E
+    I2[ColPali page_embeddings] --> E
     J[Incremental reranker training] --> E
   end
 ```
