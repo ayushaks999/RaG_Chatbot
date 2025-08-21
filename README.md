@@ -233,22 +233,6 @@ flowchart TD
 
 ---
 
-## 🐳 Deployment examples
-
-### Docker (simple)
-
-```dockerfile
-FROM python:3.10-slim
-WORKDIR /app
-COPY . /app
-RUN pip install -r requirements.txt
-ENV STREAMLIT_SERVER_HEADLESS=true
-CMD ["streamlit", "run", "app.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
-```
-
-Mount a host directory for `STORAGE_ROOT` and expose port 8501. Provide your `.env` via Docker secrets or env vars.
-
----
 
 ## 🤝 Contributing
 
@@ -267,10 +251,24 @@ This project is provided under the **MIT License**. See `LICENSE` for details.
 
 ---
 
-## 📬 Questions, edits or customizations
 
-If you want the README tailored differently (shorter, more visuals, adding deployment scripts, or a GitHub Actions CI), tell me which focus you prefer and I will update the document.
 
----
 
-*Generated for: Agentic RAG Chatbot — combined parts (PDF ingestion, RAG pipeline, persistence & UI)*
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
