@@ -1,62 +1,46 @@
 # Agentic RAG - requirements
 
-# Core app
+## Core app
 streamlit>=1.18
 PyPDF2>=3.0
 python-dotenv>=1.0
-
 nest-asyncio>=1.5
 requests>=2.28
 
-# Numeric + ML
+## Numeric & ML
 numpy>=1.24
 scikit-learn>=1.2
 joblib>=1.2
+tqdm>=4.65
 
-# Tokenization (optional but recommended for token-aware chunking)
-
+## Tokenization (optional but recommended for token-aware chunking)
 tiktoken>=0.4.0
 
-# LLM / embeddings wrappers (may need source install if not on PyPI)
+## LLM / embeddings wrappers (may require source install if not on PyPI)
 langchain-google-genai>=0.1
 langchain-community>=0.1
 langchain-core>=0.1
-
-# Vector store / Chroma dependency (if using Chroma backend)
-chromadb>=0.3
-
-# LangGraph (state graph)
 langgraph>=0.1
 
-# Reranker training tooling
-tqdm>=4.65
+## Vector store / Chroma backend
+chromadb>=0.3
 
-# OAuth helpers (optional; we use requests in the app but authlib is handy)
+## OAuth / HTTP helpers
 authlib>=1.2
+python-multipart>=0.0.5
 
-# Optional: OCR / scanned PDF support
+## OCR / scanned PDF support (optional — needs system deps)
 pillow>=9.0
 pdf2image>=1.16
-pytesseract>=0.3
+pytesseract>=0.3.10
 
-# Optional: table extraction
+## Table / document extras (optional)
 pdfplumber>=0.7
-
-# Optional: other document types & hybrid search
 python-docx>=0.8.11
 python-pptx>=0.6.21
 beautifulsoup4>=4.12.2
 rank-bm25>=0.2.2
 
-# Optional: Cassandra / AstraDB persistence (only if you plan to persist indexes)
+## Optional DB / persistence connectors (only if you plan to use them)
 cassandra-driver>=3.27.0
 cryptography>=40.0
-
-# Notes:
-# - Tesseract OCR and Poppler need to be installed separately at the OS level
-# - Some langchain-* packages may require source installs
-# - Pin versions for production reproducibility
-pytesseract>=0.3.10
-
-# Utilities
-python-multipart>=0.0.5
