@@ -904,7 +904,7 @@ def train_reranker_from_feedback():
 def main():
     nest_asyncio.apply()
     st.set_page_config(page_title="Agentic RAG Chatbot", layout="wide")
-    st.title("Agentic RAG â€” Multi-PDF RAG with Active Learning & Streaming")
+    st.title("Agentic RAG — Multi-PDF RAG with Active Learning & Streaming")
 
     if not GEMINI_API_KEY or not TAVILY_API_KEY:
         st.error("API keys for Gemini or Tavily are not configured.")
@@ -1220,7 +1220,7 @@ def main():
                                 chunk_index = meta.get("chunk_index", 0)
                                 score = best.get("score", None)
                                 cps = best.get("colpali_sim", None)
-                                st.markdown(f"**Best Source:** {filename} (p.{page}) chunk {chunk_index} â€” score: {score if score is not None else 'N/A'}  ")
+                                st.markdown(f"**Best Source:** {filename} (p.{page}) chunk {chunk_index} — score: {score if score is not None else 'N/A'}  ")
                                 if cps is not None:
                                     st.caption(f"ColPali page-image similarity: {cps:.3f}")
                                 snippet_text = best.get("text", "")[:2500]
@@ -1236,7 +1236,7 @@ def main():
                                     cur.execute("INSERT INTO feedback (user_id, question, snippet, label, ts) VALUES (?, ?, ?, ?, ?)",
                                               (current_user, user_query, snippet_text[:2000], 1, time.time()))
                                     _db_conn.commit()
-                                    st.success("Marked as relevant â€” feedback saved.")
+                                    st.success("Marked as relevant — feedback saved.")
                                     st.session_state.setdefault("feedback_examples", []).append({
                                         "user_id": current_user,
                                         "question": user_query,
@@ -1257,7 +1257,7 @@ def main():
                                     cur.execute("INSERT INTO feedback (user_id, question, snippet, label, ts) VALUES (?, ?, ?, ?, ?)",
                                               (current_user, user_query, snippet_text[:2000], 0, time.time()))
                                     _db_conn.commit()
-                                    st.success("Marked as not relevant â€” feedback saved.")
+                                    st.success("Marked as not relevant — feedback saved.")
                                     st.session_state.setdefault("feedback_examples", []).append({
                                         "user_id": current_user,
                                         "question": user_query,
@@ -1277,7 +1277,7 @@ def main():
                                 # Also show the next-best snippets and allow quick labeling
                                 if len(retrieved) > 1:
                                     st.markdown("---")
-                                    st.markdown("### Other retrieved snippets â€” quick label")
+                                    st.markdown("### Other retrieved snippets — quick label")
                                     for idx, s in enumerate(retrieved[1:6], start=2):
                                         meta = s.get("metadata", {})
                                         fname = meta.get("filename", "unknown")
