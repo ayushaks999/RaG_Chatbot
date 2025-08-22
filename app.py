@@ -738,55 +738,106 @@ Snippet:
         scored.sort(key=lambda x: x.get("score", 0.0), reverse=True)
         return {"retrieved_docs": scored}
 
+    def evaluate_node(state: State) -> Dict[str, Any]:
+        prompt = PromptTemplate(
+            template="""You are a grader assessing the relevance of retrieved snippets to a user question.
+Aggregate the relevance of all snippets and provide a single confidence score from 0.0 to 1.0.
+Respond ONLY with a JSON object containing a single key "confidence".
+
+Question: {question}
+Snippets:
+{snippets}""",
+            input_variables=["question", "snippets"],
+        )
+        evaluator_chain = prompt | state["llm"] | JsonOutputParser()
+        snippets_text = "\n\n".join([s.get("text", "") for s in state.get("retrieved_docs", [])])
+        confidence = 0.0
+        try:
+            response_json = evaluator_chain.invoke({"question": state["question"], "snippets": snippets_text})
+            confidence = float(response_json.get("confidence", 0.0))
+        except Exception:
+            confidence = 0.0
+        return {"confidence": confidence}
+
+    def web_search_node(state: State) -> Dict[str, Any]:
+        hits = []
+        try:
+            results = web_search_tool.invoke({"query": state["question"]})
+            hits = [r.get("content", "") for r in results if isinstance(r, dict) and r.get("content")]
+        except Exception:
+            hits = []
+        return {"web_results": hits}
+
+    def stream_answer(llm, prompt, placeholder):
+        if hasattr(llm, "stream") or hasattr(llm, "astream") or hasattr(llm, "invoke_stream"):
+            try:
+                stream = None
+                if hasattr(llm, "invoke_stream"):
+                    stream = llm.invoke_stream(prompt)
+                elif hasattr(llm, "stream"):
+                    stream = llm.stream(prompt)
+                elif hasattr(llm, "astream"):
+                    stream = llm.astream(prompt)
+                buf = ""
+                for part in stream:
+                    piece = getattr(part, "content", None) or str(part)
+                    buf += piece
+                    placeholder.markdown(buf)
+                return buf
+            except Exception as e:
+                print(f"streaming error: {e}")
+        out = None
+        try:
+            out = llm.invoke(prompt)
+            ans = getattr(out, "content", str(out))
+        except Exception:
+            ans = str(out) if out is not None else ""
+        sentences = re.split(r'(?<=[.!?])\s+', ans)
+        buf = ""
+        for s in sentences:
+            buf += s + " "
+            placeholder.markdown(buf)
+            time.sleep(0.12)
+        return buf
+
+    def generate_node(state: State) -> Dict[str, Any]:
+        retrieved = state.get("retrieved_docs", []) or []
+        context = ""
+        if retrieved and isinstance(retrieved, list):
+            top = retrieved[0]
+            context = top.get("text", "")
+        elif state.get("web_results"):
+            context = "\n\n".join(state.get("web_results", []))
+        else:
+            return {"answer": "I couldn't find any relevant information in the PDFs or online."}
+
+        prompt = (
+            f"You are a helpful assistant. Answer the question using only the context below. "
+            f"If no answer can be found, say so.\n\n"
+            f"Context:\n{context}\n\n"
+            f"Question: {state['question']}\n\nAnswer:"
+        )
+        try:
+            placeholder_key = f"stream_placeholder_{state.get('file_hash','')}_{hash(state['question'])}"
+            placeholder = st.session_state.get(placeholder_key)
+            if placeholder is None:
+                placeholder = st.empty()
+                st.session_state[placeholder_key] = placeholder
+            ans = stream_answer(state["llm"], prompt, placeholder)
+            return {"answer": ans}
+        except Exception as e:
+            print(f"generate_node error: {e}")
+            try:
+                response = state["llm"].invoke(prompt)
+                ans = getattr(response, "content", str(response))
+                return {"answer": ans}
+            except Exception as e2:
+                print(f"generate_node fallback error: {e2}")
+                return {"answer": "An error occurred while generating the answer."}
+
     def summarize_node(state: State) -> Dict[str, Any]:
         # Concatenate all parsed text and ask the LLM to summarize.
-        pass
-
-    # Build workflow
-    workflow = StateGraph(State)
-    workflow.add_node("initialize_models", initialize_models_node)
-    workflow.add_node("load_and_chunk_docs", load_and_chunk_docs_node)
-    workflow.add_node("create_chroma_index", create_chroma_index_node)
-    workflow.add_node("retrieve", retrieve_node)
-    workflow.add_node("rerank", rerank_node)
-    workflow.add_node("score_snippets", score_snippets_node)
-    workflow.add_node("evaluate", evaluate_node)
-    workflow.add_node("web_search", web_search_node)
-    workflow.add_node("generate", generate_node)
-    workflow.add_node("summarize", summarize_node)
-
-    workflow.set_entry_point("initialize_models")
-    workflow.add_edge("initialize_models", "load_and_chunk_docs")
-    workflow.add_edge("load_and_chunk_docs", "create_chroma_index")
-    workflow.add_edge("create_chroma_index", "retrieve")
-
-    def route_after_retrieval(state: State):
-        return "summarize" if state["question"].lower().strip() == "summarize" else "rerank"
-
-    def route_after_evaluation(state: State):
-        return "generate" if state.get("confidence", 0.0) >= 0.6 else "web_search"
-
-    workflow.add_conditional_edges("retrieve", route_after_retrieval, {"summarize": "summarize", "rerank": "rerank"})
-    workflow.add_edge("rerank", "score_snippets")
-    workflow.add_edge("score_snippets", "evaluate")
-    workflow.add_conditional_edges("evaluate", route_after_evaluation, {"generate": "generate", "web_search": "web_search"})
-    workflow.add_edge("web_search", "generate")
-    workflow.add_edge("generate", END)
-    workflow.add_edge("summarize", END)
-    return workflow.compile()
-
-# ---------- small async wrapper ----------
-async def get_rag_response(rag_app, initial_state):
-    return await rag_app.ainvoke(initial_state)
-
-# ---------- keep original train_reranker_from_feedback API ----------
-def train_reranker_from_feedback():
-    current_user = st.session_state.get("user_id")
-    if current_user is None:
-        st.warning("Login first")
-        return
-    train_reranker_incremental(current_user)
-      doc_text = ""
+        doc_text = ""
         for d in state.get("documents", []):
             try:
                 reader = PyPDF2.PdfReader(io.BytesIO(d["file_content"]))
@@ -919,7 +970,7 @@ def main():
                 st.error("Login failed")
 
     if st.session_state.get("user_id"):
-        sidebar.markdown(f"**Signed in as:** {st.session_state.get("username")}")
+        sidebar.markdown(f"**Signed in as:** {st.session_state.get('username')}")
         if sidebar.button("Logout"):
             st.session_state["user_id"] = None
             st.session_state["username"] = None
@@ -1342,5 +1393,3 @@ def main():
 # If you want to run the app directly
 if __name__ == "__main__":
     main()
-
-
