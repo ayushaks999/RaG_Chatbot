@@ -1,3 +1,6 @@
+# app_full_part1.py
+# Part 1: helpers, persistence, embeddings, ColPali index, and RAG workflow
+
 import streamlit as st
 import os
 import io
@@ -25,7 +28,7 @@ import secrets
 import base64
 from datetime import datetime, timedelta
 
-# --- Optional ColPali / ColQwen backend (graceful fallback) ---
+# Optional ColPali / ColQwen backend (graceful fallback)
 try:
     import torch  # noqa: F401
     from colpali_engine.models import ColPali, ColQwen, ColSmol
@@ -34,7 +37,7 @@ try:
 except Exception:
     COLPALI_AVAILABLE = False
 
-# OCR fallback (optional):
+# OCR fallback (optional)
 try:
     import pytesseract  # noqa: F401
     PYTESS_AVAILABLE = True
@@ -238,7 +241,6 @@ def list_user_models(user_id: int) -> List[str]:
         return []
 
 def save_uploaded_model_file(user_id: int, uploaded_file) -> str:
-    """Save uploaded model file (.joblib, .pkl) into user's models dir and return saved path."""
     data = uploaded_file.getvalue()
     fname = sanitize_filename(uploaded_file.name)
     d = get_user_model_dir(user_id)
@@ -248,12 +250,10 @@ def save_uploaded_model_file(user_id: int, uploaded_file) -> str:
     return path
 
 def load_user_reranker(user_id: int, fname: str = None) -> Tuple[bool, str]:
-    """Attempt to load a user reranker model. Returns (loaded_bool, path_or_error)."""
     if not SKLEARN_AVAILABLE or joblib is None:
         return False, "scikit-learn / joblib not available in environment"
     d = get_user_model_dir(user_id)
     if fname is None:
-        # try to load last_trained_reranker then fallback to any model
         path = os.path.join(d, "reranker_sgd.joblib")
         if not os.path.exists(path):
             files = list_user_models(user_id)
@@ -272,16 +272,32 @@ def load_user_reranker(user_id: int, fname: str = None) -> Tuple[bool, str]:
 
 # ---------- embedding cache helper ----------
 def embed_texts_wrap(emb_model, texts):
+    # Try several possible embedding method names/returns and normalize to numpy array
     try:
-        return np.array(emb_model.embed_documents(texts))
+        out = emb_model.embed_documents(texts)
+        return np.array(out)
     except Exception:
-        try:
-            return np.array(emb_model.embed(texts))
-        except Exception:
-            try:
-                return np.array([emb_model.encode(t) for t in texts])
-            except Exception:
-                return np.zeros((len(texts), 768))
+        pass
+    try:
+        out = emb_model.embed(texts)
+        return np.array(out)
+    except Exception:
+        pass
+    try:
+        # Some models expose .encode
+        out = [emb_model.encode(t) for t in texts]
+        return np.array(out)
+    except Exception:
+        pass
+    try:
+        # Some Google / Gemini wrappers return list of lists via .embed_query or .embed_documents
+        if hasattr(emb_model, "embed_query"):
+            out = [emb_model.embed_query(t) for t in texts]
+            return np.array(out)
+    except Exception:
+        pass
+    # fallback: zeros
+    return np.zeros((len(texts), 768))
 
 def embed_texts_cached(emb_model, texts, user_id, file_hash):
     cache_dir = os.path.join(STORAGE_ROOT, f"user_{user_id}", "emb_cache", file_hash)
@@ -348,7 +364,6 @@ class ColpaliIndex:
             return False
         try:
             for i, d in enumerate(docs):
-                # render pages on the fly, low DPI to avoid OOM
                 pages = convert_from_bytes(d["file_content"], dpi=110, fmt="png")
                 for p_idx, img in enumerate(pages, start=1):
                     key = self._page_key(i, p_idx)
@@ -362,7 +377,6 @@ class ColpaliIndex:
                         emb = self.model.encode_images([buf.read()])
                         np.save(out_path, emb.detach().cpu().numpy())
                     except Exception:
-                        # best-effort; skip this page
                         continue
             return True
         except Exception:
@@ -377,14 +391,12 @@ class ColpaliIndex:
             if not os.path.exists(path):
                 return 0.0
             img_emb = np.load(path)
-            # (1, D)
             try:
                 q_emb = self.model.encode_queries([query])
                 q = q_emb.detach().cpu().numpy()[0]
             except Exception:
                 return 0.0
             v = img_emb[0]
-            # cosine sim
             num = float((q * v).sum())
             den = float(np.linalg.norm(q) * np.linalg.norm(v) + 1e-8)
             return num / den if den > 0 else 0.0
@@ -406,11 +418,9 @@ def train_reranker_incremental(user_id:int):
     texts = [r[1] for r in rows]
     labels = [r[2] for r in rows]
     emb_model = st.session_state.get("embeddings_model")
-    # use last_file_hash if available to scope embeddings cache
     file_hash = st.session_state.get("last_file_hash", "global")
     X = embed_texts_cached(emb_model, texts, user_id, f"{file_hash}_feedback")
     user_model_dir = get_user_model_dir(user_id)
-    # use a timestamped filename and also update a stable name
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     model_path_ts = os.path.join(user_model_dir, f"reranker_sgd_{timestamp}.joblib")
     model_path_stable = os.path.join(user_model_dir, "reranker_sgd.joblib")
@@ -438,7 +448,7 @@ def train_reranker_incremental(user_id:int):
     except Exception as e:
         st.error(f"Failed to train reranker incrementally: {e}")
 
-# ---------- small helpers ----------
+# ---------- small helpers (persist/chat load) ----------
 
 def persist_chat(user_id:int, role:str, content:str):
     try:
@@ -448,29 +458,20 @@ def persist_chat(user_id:int, role:str, content:str):
         _db_conn.commit()
     except Exception:
         pass
-
-    # keep session_state chat_history in sync for immediate UI feedback
     try:
         if "chat_history" not in st.session_state:
             st.session_state["chat_history"] = []
         if role == "user":
-            # append a new user message with empty assistant slot
             st.session_state["chat_history"].append({"user": content, "assistant": ""})
         elif role == "assistant":
-            # fill the last assistant slot if present, otherwise append a standalone assistant message
             if st.session_state["chat_history"] and st.session_state["chat_history"][-1].get("assistant", "") == "":
                 st.session_state["chat_history"][-1]["assistant"] = content
             else:
                 st.session_state["chat_history"].append({"user": "", "assistant": content})
     except Exception:
-        # non-fatal; UI update is best-effort
         pass
 
-
 def load_user_chats(user_id: int, limit: int = 500):
-    """Load persisted chats from the SQLite DB for a given user and populate session_state.chat_history.
-    The DB stores role + content rows; we reconstruct paired user/assistant entries.
-    """
     try:
         cur = _db_conn.cursor()
         cur.execute("SELECT role, content, ts FROM chats WHERE user_id=? ORDER BY ts ASC LIMIT ?", (user_id, limit))
@@ -481,24 +482,21 @@ def load_user_chats(user_id: int, limit: int = 500):
             if role == "user":
                 pending_user = content
             elif role == "assistant":
-                # pair assistant with most recent pending user (if any)
                 conv.append({"user": pending_user or "", "assistant": content})
                 pending_user = None
-        # if a trailing user message exists without assistant reply, include it
         if pending_user is not None:
             conv.append({"user": pending_user, "assistant": ""})
         st.session_state["chat_history"] = conv
     except Exception:
-        # fall back to empty history
         if "chat_history" not in st.session_state:
             st.session_state["chat_history"] = []
 
-# ---------- existing model helpers (ensure_models) ----------
+# ---------- ensure models (LLM + embeddings) ----------
 
 def ensure_models():
     if "llm" not in st.session_state or "embeddings_model" not in st.session_state:
         if not GEMINI_API_KEY:
-            st.error("GEMINI_API_KEY not found.")
+            st.error("GEMINI_API_KEY not found. Set it in your environment or .env")
             st.stop()
         st.session_state["llm"] = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=GEMINI_API_KEY)
         st.session_state["embeddings_model"] = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GEMINI_API_KEY)
@@ -511,352 +509,327 @@ def _short_hash_bytes_multiple(docs: List[Dict[str, Any]]) -> str:
         m.update(d["file_content"])
     return m.hexdigest()[:12]
 
-# ---------- main RAG workflow (with optional ColPali hybrid rerank) ----------
+# ---------- patched create_chroma_index_node and retrieve_node (robust + fallback) ----------
 
-def run_agentic_rag():
-    web_search_tool = TavilySearchResults(max_results=4, tavily_api_key=TAVILY_API_KEY)
+def create_chroma_index_node(state: State) -> Dict[str, Any]:
+    try:
+        file_hash = state.get("file_hash")
+        user_id = state.get("user_id", "anon")
+        chunks = state.get("text_chunks", []) or []
 
-    def initialize_models_node(state: State) -> Dict[str, Any]:
-        if state.get("llm") and state.get("embeddings_model"):
-            return {}
-        if "llm" in st.session_state and "embeddings_model" in st.session_state:
-            return {"llm": st.session_state["llm"], "embeddings_model": st.session_state["embeddings_model"]}
-        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=GEMINI_API_KEY)
-        embeddings_model = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GEMINI_API_KEY)
-        return {"llm": llm, "embeddings_model": embeddings_model}
+        # DEBUG
+        print(f"[DEBUG] create_chroma_index_node: user={user_id} file_hash={file_hash} num_chunks={len(chunks)}")
+        if len(chunks) > 0:
+            sample_text = chunks[0].get("text", "")[:200].replace("\n", " ")
+            print(f"[DEBUG] sample chunk[0]: {sample_text!r}")
 
-    def load_and_chunk_docs_node(state: State) -> Dict[str, Any]:
-        out_chunks = []
-        docs = state.get("documents", []) or []
-        for i, doc in enumerate(docs):
+        if not chunks or not state.get("embeddings_model"):
+            print("[DEBUG] No chunks or no embeddings_model available -> skipping Chroma creation")
+            return {"vector_store": None}
+
+        texts = [c["text"] for c in chunks]
+        metadatas = [{"doc_id": c["doc_id"], "filename": c["filename"], "page": c["page"], "chunk_index": idx}
+                     for idx, c in enumerate(chunks)]
+        persist_dir = os.path.join(STORAGE_ROOT, f"user_{user_id}", "chroma", file_hash or "nohash")
+        os.makedirs(persist_dir, exist_ok=True)
+
+        try:
+            vector_store = Chroma.from_texts(texts=texts, embedding=state["embeddings_model"],
+                                             metadatas=metadatas, persist_directory=persist_dir)
             try:
-                reader = PyPDF2.PdfReader(io.BytesIO(doc["file_content"]))
-                for p, page in enumerate(reader.pages):
-                    page_text = page.extract_text() or ""
-                    # Optional OCR for image-only pages
-                    if not page_text.strip() and PYTESS_AVAILABLE:
-                        try:
-                            from pdf2image import convert_from_bytes
-                            imgs = convert_from_bytes(doc["file_content"], dpi=110, first_page=p+1, last_page=p+1)
-                            if imgs:
-                                page_text = pytesseract.image_to_string(imgs[0]) or ""
-                        except Exception:
-                            pass
-                    out_chunks.append({
-                        "text": page_text or "",
-                        "doc_id": i,
-                        "filename": doc.get("filename", f"doc_{i}"),
-                        "page": p + 1
-                    })
-            except Exception:
-                out_chunks.append({
-                    "text": "",
-                    "doc_id": i,
-                    "filename": doc.get("filename", f"doc_{i}"),
-                    "page": 0
-                })
-        max_tokens = 1000
-        overlap = 200
-        combined = []
-        if TIKTOKEN_AVAILABLE:
-            try:
-                enc = tiktoken.encoding_for_model("gemini-1.5-flash")
-                for c in out_chunks:
-                    tokens = enc.encode(c["text"])
-                    i2 = 0
-                    while i2 < len(tokens):
-                        chunk_tokens = tokens[i2:i2 + max_tokens]
-                        chunk_text = enc.decode(chunk_tokens)
-                        combined.append({"text": chunk_text, "doc_id": c["doc_id"], "filename": c["filename"], "page": c["page"]})
-                        i2 += max_tokens - overlap
-                return {"text_chunks": combined}
+                if hasattr(vector_store, "persist"):
+                    vector_store.persist()
             except Exception:
                 pass
-        chunk_size = 2000
-        overlap_chars = 400
-        for c in out_chunks:
-            t = c["text"]
-            if t is None:
-                t = ""
-            if not t:
-                # keep empty chunks to preserve provenance mapping for ColPali rerank
-                combined.append({"text": "", "doc_id": c["doc_id"], "filename": c["filename"], "page": c["page"]})
-                continue
-            for start in range(0, len(t), chunk_size - overlap_chars):
-                combined.append({
-                    "text": t[start:start + chunk_size],
-                    "doc_id": c["doc_id"],
-                    "filename": c["filename"],
-                    "page": c["page"]
-                })
-        return {"text_chunks": combined}
-
-    def create_chroma_index_node(state: State) -> Dict[str, Any]:
-        try:
-            file_hash = state.get("file_hash")
-            user_id = state.get("user_id", "anon")
             cache_key = f"chroma_{user_id}_{file_hash}" if file_hash else None
-            if cache_key and cache_key in st.session_state:
-                return {"vector_store": st.session_state[cache_key]}
-            chunks = state.get("text_chunks", []) or []
-            if not chunks or not state.get("embeddings_model"):
-                return {"vector_store": None}
-            texts = [c["text"] for c in chunks]
-            metadatas = [{"doc_id": c["doc_id"], "filename": c["filename"], "page": c["page"], "chunk_index": idx} for idx, c in enumerate(chunks)]
-            persist_dir = os.path.join(STORAGE_ROOT, f"user_{user_id}", "chroma", file_hash or "nohash")
-            os.makedirs(persist_dir, exist_ok=True)
-            try:
-                vector_store = Chroma.from_texts(texts=texts, embedding=state["embeddings_model"], metadatas=metadatas, persist_directory=persist_dir)
-                if hasattr(vector_store, "persist"):
-                    try:
-                        vector_store.persist()
-                    except Exception:
-                        pass
-            except TypeError:
-                vector_store = Chroma.from_texts(texts=texts, embedding=state["embeddings_model"], metadatas=metadatas)
             if cache_key:
                 st.session_state[cache_key] = vector_store
             st.session_state["chunk_store"] = chunks
+            print(f"[DEBUG] Chroma index created with {len(texts)} items")
             return {"vector_store": vector_store}
-        except Exception as e:
-            print(f"create_chroma_index_node error: {e}")
-            return {"vector_store": None}
-
-    def retrieve_node(state: State) -> Dict[str, Any]:
-        if state.get("vector_store") is None:
-            return {"retrieved_docs": []}
-        try:
-            retriever = state["vector_store"].as_retriever(search_kwargs={"k": 6})
-            docs = retriever.invoke(state["question"]) if hasattr(retriever, "invoke") else retriever.get_relevant_documents(state["question"])
-            out = []
-            for d in docs:
-                content = getattr(d, "page_content", None) or getattr(d, "content", None) or str(d)
-                meta = getattr(d, "metadata", {}) if hasattr(d, "metadata") else {}
-                out.append({"text": content, "metadata": meta})
-            return {"retrieved_docs": out}
-        except Exception as e:
-            print(f"retrieve_node error: {e}")
-            return {"retrieved_docs": []}
-
-    def colpali_hybrid_score(snippets: List[Dict[str, Any]], question: str, user_id: int, file_hash: str) -> List[Dict[str, Any]]:
-        cfg = st.session_state.get("colpali_cfg")
-        if not cfg or not cfg.get("enabled"):
-            return snippets
-        index: ColpaliIndex = cfg.get("index")
-        if not index:
-            return snippets
-        # add image-page similarity and combine with any existing score
-        rescored = []
-        for s in snippets:
-            meta = s.get("metadata", {})
-            doc_id = int(meta.get("doc_id", 0))
-            page = int(meta.get("page", 1))
+        except Exception as e_chroma:
+            print(f"[WARN] Chroma creation failed: {e_chroma}. Falling back to in-memory embeddings index.")
             try:
-                img_sim = index.query_score(question, doc_id, page)
-            except Exception:
-                img_sim = 0.0
-            # blend: 70% ColPali sim, 30% previous score (if any)
-            prev = float(s.get("score", 0.0))
-            blended = 0.7 * img_sim + 0.3 * prev
-            s2 = dict(s)
-            s2["score"] = blended
-            s2["colpali_sim"] = img_sim
-            rescored.append(s2)
-        rescored.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-        return rescored
+                X = embed_texts_cached(state["embeddings_model"], texts, user_id, (file_hash or "nohash") + "_fallback")
+                st.session_state["inmem_index"] = {"embs": np.array(X), "texts": texts, "metadatas": metadatas}
+                print(f"[DEBUG] Fallback in-memory index created shape={np.array(X).shape}")
+                return {"vector_store": None}
+            except Exception as e2:
+                print(f"[ERROR] Fallback in-memory index failed: {e2}")
+                return {"vector_store": None}
+    except Exception as e:
+        print(f"[ERROR] create_chroma_index_node exception: {e}")
+        return {"vector_store": None}
 
-    def rerank_node(state: State) -> Dict[str, Any]:
-        snippets = state.get("retrieved_docs", []) or []
-        if not snippets:
-            return {"retrieved_docs": []}
-        # First: learned text reranker if available
-        clf = st.session_state.get("reranker_model")
-        emb_model = state.get("embeddings_model")
-        if clf is not None and SKLEARN_AVAILABLE:
-            texts = [s.get("text", "") for s in snippets]
-            user_id = state.get("user_id", "anon")
-            file_hash = state.get("file_hash", "global")
-            X = embed_texts_cached(emb_model, texts, user_id, file_hash + "_rerank")
+
+def retrieve_node(state: State) -> Dict[str, Any]:
+    try:
+        if state.get("vector_store") is not None:
             try:
-                if hasattr(clf, "predict_proba"):
-                    probs = clf.predict_proba(np.array(X))[:, 1]
-                elif hasattr(clf, "decision_function"):
-                    # map decision scores to [0,1] with a simple sigmoid
-                    scores = clf.decision_function(np.array(X))
-                    probs = 1 / (1 + np.exp(-scores))
-                elif hasattr(clf, "predict"):
-                    preds = clf.predict(np.array(X))
-                    probs = np.array(preds, dtype=float)
-                else:
-                    probs = np.zeros((len(X),))
-                for i, s in enumerate(snippets):
-                    s["score"] = float(probs[i])
-            except Exception:
-                pass
-        # Then: optional ColPali hybrid re-scoring
+                retriever = state["vector_store"].as_retriever(search_kwargs={"k": 6})
+                docs = retriever.invoke(state["question"]) if hasattr(retriever, "invoke") else retriever.get_relevant_documents(state["question"])
+                out = []
+                for d in docs:
+                    content = getattr(d, "page_content", None) or getattr(d, "content", None) or str(d)
+                    meta = getattr(d, "metadata", {}) if hasattr(d, "metadata") else {}
+                    out.append({"text": content, "metadata": meta})
+                print(f"[DEBUG] retrieve_node: Chroma returned {len(out)} docs")
+                return {"retrieved_docs": out}
+            except Exception as e_r:
+                print(f"[WARN] retrieve_node: Chroma retrieval failed: {e_r} - falling back to in-memory index")
+
+        inmem = st.session_state.get("inmem_index")
+        if inmem is None:
+            print("[DEBUG] retrieve_node: no vector_store and no inmem_index -> returning []")
+            return {"retrieved_docs": []}
+
         try:
-            user_id = state.get("user_id", "anon")
-            file_hash = state.get("file_hash", "global")
-            snippets = colpali_hybrid_score(snippets, state.get("question", ""), user_id, file_hash)
+            q_emb = embed_texts_wrap(state["embeddings_model"], [state["question"]])[0]
+        except Exception as e_q:
+            print(f"[ERROR] retrieve_node: failed to compute query embedding: {e_q}")
+            return {"retrieved_docs": []}
+
+        data_embs = np.array(inmem["embs"])
+        dots = np.dot(data_embs, q_emb)
+        norms = (np.linalg.norm(data_embs, axis=1) * (np.linalg.norm(q_emb) + 1e-12))
+        sims = dots / (norms + 1e-12)
+        topk = min(6, len(sims))
+        idxs = np.argsort(sims)[::-1][:topk]
+        out = []
+        for idx in idxs:
+            out.append({
+                "text": inmem["texts"][idx],
+                "metadata": inmem["metadatas"][idx],
+                "score": float(sims[idx])
+            })
+        print(f"[DEBUG] retrieve_node: fallback returned {len(out)} docs (top sim={float(sims[idxs[0]]):.4f} if any)")
+        return {"retrieved_docs": out}
+    except Exception as e:
+        print(f"[ERROR] retrieve_node exception: {e}")
+        return {"retrieved_docs": []}
+
+# ---------- remaining RAG nodes (scoring, evaluation, generation, summarization) ----------
+
+def colpali_hybrid_score(snippets: List[Dict[str, Any]], question: str, user_id: int, file_hash: str) -> List[Dict[str, Any]]:
+    cfg = st.session_state.get("colpali_cfg")
+    if not cfg or not cfg.get("enabled"):
+        return snippets
+    index: ColpaliIndex = cfg.get("index")
+    if not index:
+        return snippets
+    rescored = []
+    for s in snippets:
+        meta = s.get("metadata", {})
+        doc_id = int(meta.get("doc_id", 0))
+        page = int(meta.get("page", 1))
+        try:
+            img_sim = index.query_score(question, doc_id, page)
+        except Exception:
+            img_sim = 0.0
+        prev = float(s.get("score", 0.0))
+        blended = 0.7 * img_sim + 0.3 * prev
+        s2 = dict(s)
+        s2["score"] = blended
+        s2["colpali_sim"] = img_sim
+        rescored.append(s2)
+    rescored.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    return rescored
+
+
+def rerank_node(state: State) -> Dict[str, Any]:
+    snippets = state.get("retrieved_docs", []) or []
+    if not snippets:
+        return {"retrieved_docs": []}
+    clf = st.session_state.get("reranker_model")
+    emb_model = state.get("embeddings_model")
+    if clf is not None and SKLEARN_AVAILABLE:
+        texts = [s.get("text", "") for s in snippets]
+        user_id = state.get("user_id", "anon")
+        file_hash = state.get("file_hash", "global")
+        X = embed_texts_cached(emb_model, texts, user_id, file_hash + "_rerank")
+        try:
+            if hasattr(clf, "predict_proba"):
+                probs = clf.predict_proba(np.array(X))[:, 1]
+            elif hasattr(clf, "decision_function"):
+                scores = clf.decision_function(np.array(X))
+                probs = 1 / (1 + np.exp(-scores))
+            elif hasattr(clf, "predict"):
+                preds = clf.predict(np.array(X))
+                probs = np.array(preds, dtype=float)
+            else:
+                probs = np.zeros((len(X),))
+            for i, s in enumerate(snippets):
+                s["score"] = float(probs[i])
         except Exception:
             pass
-        # final sort
-        snippets.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-        return {"retrieved_docs": snippets}
+    try:
+        user_id = state.get("user_id", "anon")
+        file_hash = state.get("file_hash", "global")
+        snippets = colpali_hybrid_score(snippets, state.get("question", ""), user_id, file_hash)
+    except Exception:
+        pass
+    snippets.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    return {"retrieved_docs": snippets}
 
-    def score_snippets_node(state: State) -> Dict[str, Any]:
-        snippets = state.get("retrieved_docs", []) or []
-        llm = state.get("llm")
-        if not snippets or not llm:
-            return {"retrieved_docs": snippets}
-        scored = []
-        prompt = PromptTemplate(
-            template="""You are an evaluator. For the given question and snippet return a JSON object {"confidence": <float 0.0-1.0>} estimating how well the snippet answers the question. Respond ONLY with the JSON.
+
+def score_snippets_node(state: State) -> Dict[str, Any]:
+    snippets = state.get("retrieved_docs", []) or []
+    llm = state.get("llm")
+    if not snippets or not llm:
+        return {"retrieved_docs": snippets}
+    scored = []
+    prompt = PromptTemplate(
+        template="""You are an evaluator. For the given question and snippet return a JSON object {"confidence": <float 0.0-1.0>} estimating how well the snippet answers the question. Respond ONLY with the JSON.
 
 Question: {question}
 Snippet:
 {snippet}""",
-            input_variables=["question", "snippet"],
-        )
-        for s in snippets:
-            snippet_text = s.get("text", "")
-            try:
-                evaluator_chain = prompt | llm | JsonOutputParser()
-                resp = evaluator_chain.invoke({"question": state["question"], "snippet": snippet_text})
-                conf = float(resp.get("confidence", 0.0))
-            except Exception:
-                conf = 0.0
-            s_copy = dict(s)
-            # don't override ColPali-based blended score; instead keep as additional field
-            s_copy["llm_conf"] = conf
-            # combine lightly for ordering if there was no earlier score
-            if "score" not in s_copy:
-                s_copy["score"] = conf
-            scored.append(s_copy)
-        scored.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-        return {"retrieved_docs": scored}
+        input_variables=["question", "snippet"],
+    )
+    for s in snippets:
+        snippet_text = s.get("text", "")
+        try:
+            evaluator_chain = prompt | llm | JsonOutputParser()
+            resp = evaluator_chain.invoke({"question": state["question"], "snippet": snippet_text})
+            conf = float(resp.get("confidence", 0.0))
+        except Exception:
+            conf = 0.0
+        s_copy = dict(s)
+        s_copy["llm_conf"] = conf
+        if "score" not in s_copy:
+            s_copy["score"] = conf
+        scored.append(s_copy)
+    scored.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    return {"retrieved_docs": scored}
 
-    def evaluate_node(state: State) -> Dict[str, Any]:
-        prompt = PromptTemplate(
-            template="""You are a grader assessing the relevance of retrieved snippets to a user question.
+
+def evaluate_node(state: State) -> Dict[str, Any]:
+    prompt = PromptTemplate(
+        template="""You are a grader assessing the relevance of retrieved snippets to a user question.
 Aggregate the relevance of all snippets and provide a single confidence score from 0.0 to 1.0.
 Respond ONLY with a JSON object containing a single key "confidence".
 
 Question: {question}
 Snippets:
 {snippets}""",
-            input_variables=["question", "snippets"],
-        )
-        evaluator_chain = prompt | state["llm"] | JsonOutputParser()
-        snippets_text = "\n\n".join([s.get("text", "") for s in state.get("retrieved_docs", [])])
+        input_variables=["question", "snippets"],
+    )
+    evaluator_chain = prompt | state["llm"] | JsonOutputParser()
+    snippets_text = "\n\n".join([s.get("text", "") for s in state.get("retrieved_docs", [])])
+    confidence = 0.0
+    try:
+        response_json = evaluator_chain.invoke({"question": state["question"], "snippets": snippets_text})
+        confidence = float(response_json.get("confidence", 0.0))
+    except Exception:
         confidence = 0.0
-        try:
-            response_json = evaluator_chain.invoke({"question": state["question"], "snippets": snippets_text})
-            confidence = float(response_json.get("confidence", 0.0))
-        except Exception:
-            confidence = 0.0
-        return {"confidence": confidence}
+    return {"confidence": confidence}
 
-    def web_search_node(state: State) -> Dict[str, Any]:
+
+def web_search_node(state: State) -> Dict[str, Any]:
+    hits = []
+    try:
+        web_search_tool = TavilySearchResults(max_results=4, tavily_api_key=TAVILY_API_KEY)
+        results = web_search_tool.invoke({"query": state["question"]})
+        hits = [r.get("content", "") for r in results if isinstance(r, dict) and r.get("content")]
+    except Exception as e:
+        print(f"[WARN] web_search_node failed: {e}")
         hits = []
-        try:
-            results = web_search_tool.invoke({"query": state["question"]})
-            hits = [r.get("content", "") for r in results if isinstance(r, dict) and r.get("content")]
-        except Exception:
-            hits = []
-        return {"web_results": hits}
+    return {"web_results": hits}
 
-    def stream_answer(llm, prompt, placeholder):
-        if hasattr(llm, "stream") or hasattr(llm, "astream") or hasattr(llm, "invoke_stream"):
-            try:
-                stream = None
-                if hasattr(llm, "invoke_stream"):
-                    stream = llm.invoke_stream(prompt)
-                elif hasattr(llm, "stream"):
-                    stream = llm.stream(prompt)
-                elif hasattr(llm, "astream"):
-                    stream = llm.astream(prompt)
-                buf = ""
-                for part in stream:
-                    piece = getattr(part, "content", None) or str(part)
-                    buf += piece
-                    placeholder.markdown(buf)
-                return buf
-            except Exception as e:
-                print(f"streaming error: {e}")
-        out = None
-        try:
-            out = llm.invoke(prompt)
-            ans = getattr(out, "content", str(out))
-        except Exception:
-            ans = str(out) if out is not None else ""
-        sentences = re.split(r'(?<=[.!?])\s+', ans)
-        buf = ""
-        for s in sentences:
-            buf += s + " "
-            placeholder.markdown(buf)
-            time.sleep(0.12)
-        return buf
 
-    def generate_node(state: State) -> Dict[str, Any]:
-        retrieved = state.get("retrieved_docs", []) or []
-        context = ""
-        if retrieved and isinstance(retrieved, list):
-            top = retrieved[0]
-            context = top.get("text", "")
-        elif state.get("web_results"):
-            context = "\n\n".join(state.get("web_results", []))
-        else:
-            return {"answer": "I couldn't find any relevant information in the PDFs or online."}
-
-        prompt = (
-            f"You are a helpful assistant. Answer the question using only the context below. "
-            f"If no answer can be found, say so.\n\n"
-            f"Context:\n{context}\n\n"
-            f"Question: {state['question']}\n\nAnswer:"
-        )
+def stream_answer(llm, prompt, placeholder):
+    if hasattr(llm, "stream") or hasattr(llm, "astream") or hasattr(llm, "invoke_stream"):
         try:
-            placeholder_key = f"stream_placeholder_{state.get('file_hash','')}_{hash(state['question'])}"
-            placeholder = st.session_state.get(placeholder_key)
-            if placeholder is None:
-                placeholder = st.empty()
-                st.session_state[placeholder_key] = placeholder
-            ans = stream_answer(state["llm"], prompt, placeholder)
-            return {"answer": ans}
+            stream = None
+            if hasattr(llm, "invoke_stream"):
+                stream = llm.invoke_stream(prompt)
+            elif hasattr(llm, "stream"):
+                stream = llm.stream(prompt)
+            elif hasattr(llm, "astream"):
+                stream = llm.astream(prompt)
+            buf = ""
+            for part in stream:
+                piece = getattr(part, "content", None) or str(part)
+                buf += piece
+                placeholder.markdown(buf)
+            return buf
         except Exception as e:
-            print(f"generate_node error: {e}")
-            try:
-                response = state["llm"].invoke(prompt)
-                ans = getattr(response, "content", str(response))
-                return {"answer": ans}
-            except Exception as e2:
-                print(f"generate_node fallback error: {e2}")
-                return {"answer": "An error occurred while generating the answer."}
+            print(f"streaming error: {e}")
+    out = None
+    try:
+        out = llm.invoke(prompt)
+        ans = getattr(out, "content", str(out))
+    except Exception:
+        ans = str(out) if out is not None else ""
+    sentences = re.split(r'(?<=[.!?])\s+', ans)
+    buf = ""
+    for s in sentences:
+        buf += s + " "
+        placeholder.markdown(buf)
+        time.sleep(0.12)
+    return buf
 
-    def summarize_node(state: State) -> Dict[str, Any]:
-        # Concatenate all parsed text and ask the LLM to summarize.
-        doc_text = ""
-        for d in state.get("documents", []):
-            try:
-                reader = PyPDF2.PdfReader(io.BytesIO(d["file_content"]))
-                for p in reader.pages:
-                    page_text = p.extract_text() or ""
-                    doc_text += page_text + "\n\n"
-            except Exception:
-                pass
-        # keep context size bounded
-        prompt = f"Summarize the following documents. Keep the summary concise but complete, include section headings if helpful.\n\n{doc_text[:15000]}"
+
+def generate_node(state: State) -> Dict[str, Any]:
+    retrieved = state.get("retrieved_docs", []) or []
+    context = ""
+    if retrieved and isinstance(retrieved, list):
+        top = retrieved[0]
+        context = top.get("text", "")
+    elif state.get("web_results"):
+        context = "\n\n".join(state.get("web_results", []))
+    else:
+        return {"answer": "I couldn't find any relevant information in the PDFs or online."}
+
+    prompt = (
+        f"You are a helpful assistant. Answer the question using only the context below. "
+        f"If no answer can be found, say so.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {state['question']}\n\nAnswer:"
+    )
+    try:
+        placeholder_key = f"stream_placeholder_{state.get('file_hash','')}_{hash(state['question'])}"
+        placeholder = st.session_state.get(placeholder_key)
+        if placeholder is None:
+            placeholder = st.empty()
+            st.session_state[placeholder_key] = placeholder
+        ans = stream_answer(state["llm"], prompt, placeholder)
+        return {"answer": ans}
+    except Exception as e:
+        print(f"generate_node error: {e}")
         try:
             response = state["llm"].invoke(prompt)
             ans = getattr(response, "content", str(response))
             return {"answer": ans}
-        except Exception as e:
-            print(f"summarize_node error: {e}")
-            return {"answer": "An error occurred while summarizing the document."}
+        except Exception as e2:
+            print(f"generate_node fallback error: {e2}")
+            return {"answer": "An error occurred while generating the answer."}
 
-    # Build workflow
+
+def summarize_node(state: State) -> Dict[str, Any]:
+    doc_text = ""
+    for d in state.get("documents", []):
+        try:
+            reader = PyPDF2.PdfReader(io.BytesIO(d["file_content"]))
+            for p in reader.pages:
+                page_text = p.extract_text() or ""
+                doc_text += page_text + "\n\n"
+        except Exception:
+            pass
+    prompt = f"Summarize the following documents. Keep the summary concise but complete, include section headings if helpful.\n\n{doc_text[:15000]}"
+    try:
+        response = state["llm"].invoke(prompt)
+        ans = getattr(response, "content", str(response))
+        return {"answer": ans}
+    except Exception as e:
+        print(f"summarize_node error: {e}")
+        return {"answer": "An error occurred while summarizing the document."}
+
+# ---------- Build workflow ----------
+
+def run_agentic_rag():
     workflow = StateGraph(State)
-    workflow.add_node("initialize_models", initialize_models_node)
+    workflow.add_node("initialize_models", lambda s: ({}))
     workflow.add_node("load_and_chunk_docs", load_and_chunk_docs_node)
     workflow.add_node("create_chroma_index", create_chroma_index_node)
     workflow.add_node("retrieve", retrieve_node)
@@ -886,6 +859,91 @@ Snippets:
     workflow.add_edge("generate", END)
     workflow.add_edge("summarize", END)
     return workflow.compile()
+
+# app_full_part2.py
+# Part 2: chunking, Streamlit UI, and app runner
+
+import streamlit as st
+import io
+import time
+import os
+import PyPDF2
+from typing import List, Dict, Any
+
+# --------------------------------------------------------------------------------
+# load functions and globals from part1
+# (When you combine the two files, part1 content should appear *before* this file.)
+# --------------------------------------------------------------------------------
+
+# Implement load_and_chunk_docs_node here (kept in second file for readability)
+
+def load_and_chunk_docs_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    out_chunks = []
+    docs = state.get("documents", []) or []
+    for i, doc in enumerate(docs):
+        try:
+            reader = PyPDF2.PdfReader(io.BytesIO(doc["file_content"]))
+            for p, page in enumerate(reader.pages):
+                page_text = page.extract_text() or ""
+                # Optional OCR for image-only pages
+                if not page_text.strip() and globals().get("PYTESS_AVAILABLE"):
+                    try:
+                        from pdf2image import convert_from_bytes
+                        import pytesseract
+                        imgs = convert_from_bytes(doc["file_content"], dpi=110, first_page=p+1, last_page=p+1)
+                        if imgs:
+                            page_text = pytesseract.image_to_string(imgs[0]) or ""
+                    except Exception:
+                        pass
+                out_chunks.append({
+                    "text": page_text or "",
+                    "doc_id": i,
+                    "filename": doc.get("filename", f"doc_{i}"),
+                    "page": p + 1
+                })
+        except Exception:
+            out_chunks.append({
+                "text": "",
+                "doc_id": i,
+                "filename": doc.get("filename", f"doc_{i}"),
+                "page": 0
+            })
+    max_tokens = 1000
+    overlap = 200
+    combined = []
+    TIKTOKEN_AVAILABLE = globals().get("TIKTOKEN_AVAILABLE")
+    if TIKTOKEN_AVAILABLE:
+        try:
+            import tiktoken
+            enc = tiktoken.encoding_for_model("gemini-1.5-flash")
+            for c in out_chunks:
+                tokens = enc.encode(c["text"]) if c.get("text") else []
+                i2 = 0
+                while i2 < len(tokens):
+                    chunk_tokens = tokens[i2:i2 + max_tokens]
+                    chunk_text = enc.decode(chunk_tokens)
+                    combined.append({"text": chunk_text, "doc_id": c["doc_id"], "filename": c["filename"], "page": c["page"]})
+                    i2 += max_tokens - overlap
+            return {"text_chunks": combined}
+        except Exception:
+            pass
+    # character-based fallback
+    chunk_size = 2000
+    overlap_chars = 400
+    for c in out_chunks:
+        t = c["text"] or ""
+        if not t:
+            combined.append({"text": "", "doc_id": c["doc_id"], "filename": c["filename"], "page": c["page"]})
+            continue
+        for start in range(0, len(t), chunk_size - overlap_chars):
+            combined.append({
+                "text": t[start:start + chunk_size],
+                "doc_id": c["doc_id"],
+                "filename": c["filename"],
+                "page": c["page"]
+            })
+    return {"text_chunks": combined}
+
 # ---------- small async wrapper ----------
 async def get_rag_response(rag_app, initial_state):
     return await rag_app.ainvoke(initial_state)
@@ -896,6 +954,8 @@ def train_reranker_from_feedback():
     if current_user is None:
         st.warning("Login first")
         return
+    # train function from part1
+    from __main__ import train_reranker_incremental
     train_reranker_incremental(current_user)
 
 # ---------- main app UI ----------
@@ -905,8 +965,8 @@ def main():
     st.set_page_config(page_title="Agentic RAG Chatbot", layout="wide")
     st.title("Agentic RAG — Multi-PDF RAG with Active Learning & Streaming")
 
-    if not GEMINI_API_KEY or not TAVILY_API_KEY:
-        st.error("API keys for Gemini or Tavily are not configured.")
+    if not globals().get("GEMINI_API_KEY") or not globals().get("TAVILY_API_KEY"):
+        st.error("API keys for Gemini or Tavily are not configured. Set GEMINI_API_KEY and TAVILY_API_KEY in environment.")
         st.stop()
 
     # session defaults
@@ -917,7 +977,7 @@ def main():
     if "reranker_model" not in st.session_state:
         st.session_state.reranker_model = None
     if "storage_root" not in st.session_state:
-        st.session_state["storage_root"] = STORAGE_ROOT
+        st.session_state["storage_root"] = globals().get("STORAGE_ROOT")
     if "user_id" not in st.session_state:
         st.session_state["user_id"] = None
     if "username" not in st.session_state:
@@ -948,26 +1008,20 @@ def main():
             if uid:
                 st.session_state["user_id"] = uid
                 st.session_state["username"] = auth_username.strip()
-                # load persisted chats for this user so chat history is visible after login
                 try:
                     load_user_chats(uid)
                 except Exception:
                     pass
-                # try loading any previously trained reranker model for this user
-                if SKLEARN_AVAILABLE and joblib:
+                if globals().get("SKLEARN_AVAILABLE") and globals().get("joblib"):
                     ok, msg = load_user_reranker(uid)
-                    # msg contains path or error message
                     if ok:
                         st.session_state["last_trained_reranker"] = st.session_state.get("loaded_reranker")
-                    else:
-                        # no model found or failed to load; that's fine
-                        pass
                 st.success("Logged in")
             else:
                 st.error("Login failed")
 
     if st.session_state.get("user_id"):
-        sidebar.markdown(f"**Signed in as:** {st.session_state.get("username")}")
+        sidebar.markdown(f"**Signed in as:** {st.session_state.get('username')}")
         if sidebar.button("Logout"):
             st.session_state["user_id"] = None
             st.session_state["username"] = None
@@ -979,23 +1033,20 @@ def main():
         st.session_state.chat_history = []
     if sidebar.button("Clear Feedback"):
         st.session_state.feedback_examples = []
-        # also clear DB rows for user if desired
     save_path = sidebar.text_input("Model save dir", value="/tmp")
     st.session_state["reranker_path"] = save_path
 
-    # --- RERANKER MODEL MANAGEMENT UI ---
+    # Reranker management UI
     sidebar.markdown("---")
     sidebar.subheader("Reranker model management")
-    if SKLEARN_AVAILABLE and joblib:
+    if globals().get("SKLEARN_AVAILABLE") and globals().get("joblib"):
         if st.session_state.get("user_id"):
             user_id = st.session_state.get("user_id")
-            # Upload a model file
             uploaded_model_file = sidebar.file_uploader("Upload reranker (.joblib/.pkl)", type=["joblib", "pkl"], key="upload_reranker")
             if uploaded_model_file is not None:
                 try:
                     saved_path = save_uploaded_model_file(user_id, uploaded_model_file)
                     st.success(f"Saved model to {saved_path}")
-                    # auto-load it
                     ok, msg = load_user_reranker(user_id, os.path.basename(saved_path))
                     if ok:
                         st.success("Reranker uploaded and loaded into session.")
@@ -1003,8 +1054,6 @@ def main():
                         st.warning(f"Saved but failed to load: {msg}")
                 except Exception as e:
                     st.error(f"Failed to save uploaded model: {e}")
-
-            # list available models and allow selection
             models = list_user_models(user_id)
             selected_model = None
             if models:
@@ -1028,7 +1077,7 @@ def main():
     else:
         sidebar.info("scikit-learn / joblib not available in this environment. Model upload / load disabled.")
 
-    # Manual feedback expander - lets user paste a snippet and label it directly
+    # Manual feedback expander
     with sidebar.expander("Manual feedback (paste snippet + label)"):
         manual_question = st.text_input("Question (optional)", key="manual_feedback_question")
         manual_snippet = st.text_area("Snippet text", key="manual_feedback_snippet", height=150)
@@ -1054,8 +1103,7 @@ def main():
                     "label": label_val,
                     "ts": time.time(),
                 })
-                # Attempt to train immediately (best-effort)
-                if SKLEARN_AVAILABLE:
+                if globals().get("SKLEARN_AVAILABLE"):
                     try:
                         train_reranker_incremental(current_user)
                     except Exception as e:
@@ -1063,7 +1111,6 @@ def main():
                 else:
                     st.info("Install scikit-learn to enable retrainer training")
 
-    # show feedback count
     fb_rows = 0
     try:
         if st.session_state.get("user_id"):
@@ -1074,7 +1121,7 @@ def main():
         fb_rows = len(st.session_state.get("feedback_examples", []))
     sidebar.markdown(f"**Feedback examples:** {fb_rows}")
 
-    # Optional ColPali hybrid controls
+    # ColPali hybrid controls
     sidebar.markdown("---")
     colpali_enabled = sidebar.checkbox("Enable ColPali/ColQwen hybrid rerank (experimental)", value=False)
     colpali_model = sidebar.selectbox("Col model", [
@@ -1082,11 +1129,11 @@ def main():
         "vidore/colqwen-v1.0",
         "vidore/colsmol-v1.0"
     ], index=0)
-    if colpali_enabled and not COLPALI_AVAILABLE:
+    if colpali_enabled and not globals().get("COLPALI_AVAILABLE"):
         sidebar.warning("ColPali backend not installed or torch/pdf2image unavailable. Falling back to text-only.")
         colpali_enabled = False
 
-    if SKLEARN_AVAILABLE:
+    if globals().get("SKLEARN_AVAILABLE"):
         if sidebar.button("Train reranker from feedback"):
             current_user = st.session_state.get("user_id")
             if current_user is None:
@@ -1096,7 +1143,7 @@ def main():
     else:
         sidebar.info("Install scikit-learn to enable reranker training")
 
-    # handle uploaded files: if user logged in, save to per-user storage; else keep in-memory
+    # handle uploaded files
     docs = []
     if uploaded_files:
         files_list = uploaded_files if isinstance(uploaded_files, list) else [uploaded_files]
@@ -1108,7 +1155,7 @@ def main():
                     docs.append({"filename": saved["filename"], "file_content": saved["raw"]})
                 else:
                     raw = f.getvalue()
-                    if len(raw) > MAX_UPLOAD_BYTES:
+                    if len(raw) > globals().get("MAX_UPLOAD_BYTES"):
                         st.warning(f"Skipped {f.name}: file too large for anonymous upload.")
                         continue
                     docs.append({"filename": f.name, "file_content": raw})
@@ -1122,11 +1169,7 @@ def main():
         try:
             current_user = st.session_state.get("user_id") or 0
             file_hash_preview = _short_hash_bytes_multiple(docs)
-            cfg = {
-                "enabled": True,
-                "model_name": colpali_model,
-                "index": None,
-            }
+            cfg = {"enabled": True, "model_name": colpali_model, "index": None}
             index = ColpaliIndex(colpali_model, current_user, file_hash_preview)
             ok = index.ensure_page_embeddings(docs)
             if ok:
@@ -1145,7 +1188,6 @@ def main():
     col1, col2 = st.columns([1, 2])
     with col1:
         st.subheader("Chat History")
-        # display persisted or session chat history
         if st.session_state.chat_history:
             for chat in reversed(st.session_state.chat_history[-200:]):
                 st.markdown(f"**You:** {chat.get('user','')}")
@@ -1184,9 +1226,11 @@ def main():
                 else:
                     with st.spinner("Thinking..."):
                         llm, embeddings_model = ensure_models()
+                        # prepare workflow lazily
                         if "rag_app" not in st.session_state:
                             st.session_state["rag_app"] = run_agentic_rag()
                         rag_app = st.session_state["rag_app"]
+                        # chunk docs first
                         file_hash = _short_hash_bytes_multiple(docs) if docs else _short_hash_bytes(b"no-doc")
                         initial_state = {
                             "documents": docs,
@@ -1197,7 +1241,6 @@ def main():
                             "user_id": current_user
                         }
                         st.session_state["last_file_hash"] = file_hash
-                        # persist user message (DB + session)
                         persist_chat(current_user, "user", user_query)
                         try:
                             final_state = run_async(get_rag_response(rag_app, initial_state))
@@ -1205,7 +1248,6 @@ def main():
                             retrieved = final_state.get("retrieved_docs", [])
                             confidence = final_state.get("confidence", 0.0)
 
-                            # --- REPLACED RETRIEVED UI BLOCK (includes feedback buttons) ---
                             st.markdown("## Answer")
                             st.write(answer)
                             st.markdown(f"**Confidence:** {confidence:.2f}")
@@ -1224,7 +1266,6 @@ def main():
                                     st.caption(f"ColPali page-image similarity: {cps:.3f}")
                                 snippet_text = best.get("text", "")[:2500]
                                 st.write(snippet_text)
-                                # deterministic keys so Streamlit buttons work across reruns
                                 qhash = abs(hash(user_query)) if user_query else 0
                                 file_hash_short = file_hash or "nohash"
                                 rel_key = f"mark_rel_{file_hash_short}_{chunk_index}_{qhash}"
@@ -1243,8 +1284,7 @@ def main():
                                         "label": 1,
                                         "ts": time.time(),
                                     })
-                                    # Train reranker immediately after feedback (best-effort)
-                                    if SKLEARN_AVAILABLE:
+                                    if globals().get("SKLEARN_AVAILABLE"):
                                         try:
                                             train_reranker_incremental(current_user)
                                         except Exception as e:
@@ -1264,8 +1304,7 @@ def main():
                                         "label": 0,
                                         "ts": time.time(),
                                     })
-                                    # Train reranker immediately after feedback (best-effort)
-                                    if SKLEARN_AVAILABLE:
+                                    if globals().get("SKLEARN_AVAILABLE"):
                                         try:
                                             train_reranker_incremental(current_user)
                                         except Exception as e:
@@ -1273,7 +1312,6 @@ def main():
                                     else:
                                         st.info("Install scikit-learn to enable reranker training")
 
-                                # Also show the next-best snippets and allow quick labeling
                                 if len(retrieved) > 1:
                                     st.markdown("---")
                                     st.markdown("### Other retrieved snippets — quick label")
@@ -1285,7 +1323,6 @@ def main():
                                         st.markdown(f"**#{idx}** Source: {fname} (p.{pnum}) chunk {chunk_idx}")
                                         txt = s.get("text", "")[:2000]
                                         st.write(txt)
-                                        # deterministic keys per snippet
                                         qh = abs(hash(user_query)) if user_query else 0
                                         rel_k = f"rel_{file_hash_short}_{chunk_idx}_{qh}"
                                         notrel_k = f"notrel_{file_hash_short}_{chunk_idx}_{qh}"
@@ -1305,8 +1342,7 @@ def main():
                                                 "label": 1,
                                                 "ts": time.time(),
                                             })
-                                            # Train reranker (best-effort)
-                                            if SKLEARN_AVAILABLE:
+                                            if globals().get("SKLEARN_AVAILABLE"):
                                                 try:
                                                     train_reranker_incremental(current_user)
                                                 except Exception as e:
@@ -1328,8 +1364,7 @@ def main():
                                                 "label": 0,
                                                 "ts": time.time(),
                                             })
-                                            # Train reranker (best-effort)
-                                            if SKLEARN_AVAILABLE:
+                                            if globals().get("SKLEARN_AVAILABLE"):
                                                 try:
                                                     train_reranker_incremental(current_user)
                                                 except Exception as e:
@@ -1340,7 +1375,6 @@ def main():
                             else:
                                 st.info("No retrieved snippets to display. Consider uploading PDFs or widening your search query.")
 
-                            # persist assistant answer (DB + session)
                             try:
                                 persist_chat(current_user, "assistant", answer)
                             except Exception:
@@ -1349,7 +1383,6 @@ def main():
                         except Exception as e:
                             st.error(f"Failed to get an answer: {e}")
 
-        # ------------------ NEW: Summarize all uploaded documents ------------------
         if st.button("Summarize documents"):
             current_user = st.session_state.get("user_id")
             if not docs:
@@ -1374,19 +1407,18 @@ def main():
                         "user_id": current_user
                     }
                     st.session_state["last_file_hash"] = file_hash
-                    # persist user action (summarize) for audit
                     persist_chat(current_user, "user", "summarize")
                     try:
                         final_state = run_async(get_rag_response(rag_app, initial_state))
                         answer = final_state.get("answer", "No summary generated.")
                         st.markdown("## Document Summary")
                         st.write(answer)
-                        # store assistant summary
                         st.session_state["chat_history"].append({"user": "summarize", "assistant": answer})
                         persist_chat(current_user, "assistant", answer)
                     except Exception as e:
                         st.error(f"Error summarizing: {e}")
 
-# If you want to run the app directly
+# If running as single-file app, ensure that part1 code is loaded in __main__ then call main
 if __name__ == "__main__":
     main()
+    
