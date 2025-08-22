@@ -1,4 +1,3 @@
-# PART 1
 import streamlit as st
 import os
 import io
@@ -22,25 +21,29 @@ from dotenv import load_dotenv
 import numpy as np
 import time
 
+# additional imports for persistence / auth / incremental training
 import sqlite3
 import secrets
 import base64
 from datetime import datetime, timedelta
 
+# --- Optional ColPali / ColQwen backend (graceful fallback) ---
 try:
-    import torch
+    import torch  # noqa: F401
     from colpali_engine.models import ColPali, ColQwen, ColSmol
     from pdf2image import convert_from_bytes
     COLPALI_AVAILABLE = True
 except Exception:
     COLPALI_AVAILABLE = False
 
+# OCR fallback (optional):
 try:
-    import pytesseract
+    import pytesseract  # noqa: F401
     PYTESS_AVAILABLE = True
 except Exception:
     PYTESS_AVAILABLE = False
 
+# sklearn / joblib availability detection
 try:
     from sklearn.linear_model import SGDClassifier
     import joblib
@@ -57,6 +60,7 @@ except Exception:
 
 load_dotenv()
 
+# ---------- basic secrets helpers ----------
 def _get_secret(name: str):
     val = os.environ.get(name)
     if val:
@@ -71,16 +75,19 @@ def _get_secret(name: str):
 GEMINI_API_KEY = _get_secret("GEMINI_API_KEY")
 TAVILY_API_KEY = _get_secret("TAVILY_API_KEY")
 
+# ---------- misc helpers ----------
 def _short_hash_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()[:12]
 
-async def run_async(coro):
+# Safe async runner for Streamlit
+def run_async(coro):
     try:
-        return await coro
-    except Exception:
+        return asyncio.run(coro)
+    except RuntimeError:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: None)
+        return loop.run_until_complete(coro)
 
+# ---------- State type (extended) ----------
 class State(TypedDict):
     documents: List[Dict[str, Any]]
     question: str
@@ -96,6 +103,7 @@ class State(TypedDict):
     file_hash: str
     user_id: int
 
+# ---------- persistence + multi-user configuration ----------
 DB_PATH = os.environ.get("AGENTIC_RAG_DB_PATH", "/tmp/agentic_rag.db")
 STORAGE_ROOT = os.environ.get("AGENTIC_RAG_STORAGE", "/tmp/agentic_rag_storage")
 os.makedirs(STORAGE_ROOT, exist_ok=True)
@@ -141,6 +149,7 @@ def init_db(db_path=DB_PATH):
 
 _db_conn = init_db()
 
+# ---------- auth helpers ----------
 def _hash_password(password: str, salt: str = None):
     if salt is None:
         salt = secrets.token_hex(16)
@@ -169,6 +178,7 @@ def verify_user(username: str, password: str):
         return uid
     return None
 
+# ---------- rate limiter (simple, per-minute) ----------
 RATE_LIMIT_N = int(os.environ.get("AGENTIC_RAG_RATE_LIMIT_N", "30"))
 
 def check_rate_limit(user_id: int):
@@ -192,10 +202,11 @@ def check_rate_limit(user_id: int):
     _db_conn.commit()
     return True
 
+# ---------- file sanitization and saving ----------
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[^A-Za-z0-9_.-]', '_', name)
 
-MAX_UPLOAD_BYTES = int(os.environ.get("AGENTIC_RAG_MAX_UPLOAD_BYTES", 10 * 1024 * 1024))
+MAX_UPLOAD_BYTES = int(os.environ.get("AGENTIC_RAG_MAX_UPLOAD_BYTES", 10 * 1024 * 1024))  # 10 MB
 
 def save_uploaded_file(user_id: int, uploaded_file):
     raw = uploaded_file.getvalue()
@@ -214,6 +225,7 @@ def save_uploaded_file(user_id: int, uploaded_file):
     _db_conn.commit()
     return {"path": path, "file_hash": file_hash, "filename": safe_name, "raw": raw}
 
+# ---------- model file helpers (for reranker management) ----------
 def get_user_model_dir(user_id: int) -> str:
     user_model_dir = os.path.join(STORAGE_ROOT, f"user_{user_id}", "models")
     os.makedirs(user_model_dir, exist_ok=True)
@@ -228,6 +240,7 @@ def list_user_models(user_id: int) -> List[str]:
         return []
 
 def save_uploaded_model_file(user_id: int, uploaded_file) -> str:
+    """Save uploaded model file (.joblib, .pkl) into user's models dir and return saved path."""
     data = uploaded_file.getvalue()
     fname = sanitize_filename(uploaded_file.name)
     d = get_user_model_dir(user_id)
@@ -237,10 +250,12 @@ def save_uploaded_model_file(user_id: int, uploaded_file) -> str:
     return path
 
 def load_user_reranker(user_id: int, fname: str = None) -> Tuple[bool, str]:
+    """Attempt to load a user reranker model. Returns (loaded_bool, path_or_error)."""
     if not SKLEARN_AVAILABLE or joblib is None:
         return False, "scikit-learn / joblib not available in environment"
     d = get_user_model_dir(user_id)
     if fname is None:
+        # try to load last_trained_reranker then fallback to any model
         path = os.path.join(d, "reranker_sgd.joblib")
         if not os.path.exists(path):
             files = list_user_models(user_id)
@@ -257,6 +272,7 @@ def load_user_reranker(user_id: int, fname: str = None) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"failed to load model: {e}"
 
+# ---------- embedding cache helper ----------
 def embed_texts_wrap(emb_model, texts):
     try:
         return np.array(emb_model.embed_documents(texts))
@@ -283,6 +299,8 @@ def embed_texts_cached(emb_model, texts, user_id, file_hash):
         return X
     except Exception:
         return embed_texts_wrap(emb_model, texts)
+
+# ---------- ColPali helpers (optional + crash-proof) ----------
 
 def colpali_device():
     try:
@@ -332,6 +350,7 @@ class ColpaliIndex:
             return False
         try:
             for i, d in enumerate(docs):
+                # render pages on the fly, low DPI to avoid OOM
                 pages = convert_from_bytes(d["file_content"], dpi=110, fmt="png")
                 for p_idx, img in enumerate(pages, start=1):
                     key = self._page_key(i, p_idx)
@@ -345,6 +364,7 @@ class ColpaliIndex:
                         emb = self.model.encode_images([buf.read()])
                         np.save(out_path, emb.detach().cpu().numpy())
                     except Exception:
+                        # best-effort; skip this page
                         continue
             return True
         except Exception:
@@ -359,17 +379,21 @@ class ColpaliIndex:
             if not os.path.exists(path):
                 return 0.0
             img_emb = np.load(path)
+            # (1, D)
             try:
                 q_emb = self.model.encode_queries([query])
                 q = q_emb.detach().cpu().numpy()[0]
             except Exception:
                 return 0.0
             v = img_emb[0]
+            # cosine sim
             num = float((q * v).sum())
             den = float(np.linalg.norm(q) * np.linalg.norm(v) + 1e-8)
             return num / den if den > 0 else 0.0
         except Exception:
             return 0.0
+
+# ---------- reranker incremental training ----------
 
 def train_reranker_incremental(user_id:int):
     if not SKLEARN_AVAILABLE:
@@ -384,9 +408,11 @@ def train_reranker_incremental(user_id:int):
     texts = [r[1] for r in rows]
     labels = [r[2] for r in rows]
     emb_model = st.session_state.get("embeddings_model")
+    # use last_file_hash if available to scope embeddings cache
     file_hash = st.session_state.get("last_file_hash", "global")
     X = embed_texts_cached(emb_model, texts, user_id, f"{file_hash}_feedback")
     user_model_dir = get_user_model_dir(user_id)
+    # use a timestamped filename and also update a stable name
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     model_path_ts = os.path.join(user_model_dir, f"reranker_sgd_{timestamp}.joblib")
     model_path_stable = os.path.join(user_model_dir, "reranker_sgd.joblib")
@@ -414,6 +440,8 @@ def train_reranker_incremental(user_id:int):
     except Exception as e:
         st.error(f"Failed to train reranker incrementally: {e}")
 
+# ---------- small helpers ----------
+
 def persist_chat(user_id:int, role:str, content:str):
     try:
         c = _db_conn.cursor()
@@ -422,20 +450,29 @@ def persist_chat(user_id:int, role:str, content:str):
         _db_conn.commit()
     except Exception:
         pass
+
+    # keep session_state chat_history in sync for immediate UI feedback
     try:
         if "chat_history" not in st.session_state:
             st.session_state["chat_history"] = []
         if role == "user":
+            # append a new user message with empty assistant slot
             st.session_state["chat_history"].append({"user": content, "assistant": ""})
         elif role == "assistant":
+            # fill the last assistant slot if present, otherwise append a standalone assistant message
             if st.session_state["chat_history"] and st.session_state["chat_history"][-1].get("assistant", "") == "":
                 st.session_state["chat_history"][-1]["assistant"] = content
             else:
                 st.session_state["chat_history"].append({"user": "", "assistant": content})
     except Exception:
+        # non-fatal; UI update is best-effort
         pass
 
+
 def load_user_chats(user_id: int, limit: int = 500):
+    """Load persisted chats from the SQLite DB for a given user and populate session_state.chat_history.
+    The DB stores role + content rows; we reconstruct paired user/assistant entries.
+    """
     try:
         cur = _db_conn.cursor()
         cur.execute("SELECT role, content, ts FROM chats WHERE user_id=? ORDER BY ts ASC LIMIT ?", (user_id, limit))
@@ -446,23 +483,29 @@ def load_user_chats(user_id: int, limit: int = 500):
             if role == "user":
                 pending_user = content
             elif role == "assistant":
+                # pair assistant with most recent pending user (if any)
                 conv.append({"user": pending_user or "", "assistant": content})
                 pending_user = None
+        # if a trailing user message exists without assistant reply, include it
         if pending_user is not None:
             conv.append({"user": pending_user, "assistant": ""})
         st.session_state["chat_history"] = conv
     except Exception:
+        # fall back to empty history
         if "chat_history" not in st.session_state:
             st.session_state["chat_history"] = []
+
+# ---------- existing model helpers (ensure_models) ----------
 
 def ensure_models():
     if "llm" not in st.session_state or "embeddings_model" not in st.session_state:
         if not GEMINI_API_KEY:
-            st.error("GEMINI_API_KEY not found. Please set it in environment or Streamlit secrets.")
+            st.error("GEMINI_API_KEY not found.")
             st.stop()
         st.session_state["llm"] = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=GEMINI_API_KEY)
         st.session_state["embeddings_model"] = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GEMINI_API_KEY)
     return st.session_state["llm"], st.session_state["embeddings_model"]
+
 
 def _short_hash_bytes_multiple(docs: List[Dict[str, Any]]) -> str:
     m = hashlib.sha256()
@@ -470,8 +513,10 @@ def _short_hash_bytes_multiple(docs: List[Dict[str, Any]]) -> str:
         m.update(d["file_content"])
     return m.hexdigest()[:12]
 
+# ---------- main RAG workflow (with optional ColPali hybrid rerank) ----------
+
 def run_agentic_rag():
-    web_search_tool = TavilySearchResults(max_results=4, tavily_api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
+    web_search_tool = TavilySearchResults(max_results=4, tavily_api_key=TAVILY_API_KEY)
 
     def initialize_models_node(state: State) -> Dict[str, Any]:
         if state.get("llm") and state.get("embeddings_model"):
@@ -490,6 +535,7 @@ def run_agentic_rag():
                 reader = PyPDF2.PdfReader(io.BytesIO(doc["file_content"]))
                 for p, page in enumerate(reader.pages):
                     page_text = page.extract_text() or ""
+                    # Optional OCR for image-only pages
                     if not page_text.strip() and PYTESS_AVAILABLE:
                         try:
                             from pdf2image import convert_from_bytes
@@ -535,6 +581,7 @@ def run_agentic_rag():
             if t is None:
                 t = ""
             if not t:
+                # keep empty chunks to preserve provenance mapping for ColPali rerank
                 combined.append({"text": "", "doc_id": c["doc_id"], "filename": c["filename"], "page": c["page"]})
                 continue
             for start in range(0, len(t), chunk_size - overlap_chars):
@@ -600,6 +647,7 @@ def run_agentic_rag():
         index: ColpaliIndex = cfg.get("index")
         if not index:
             return snippets
+        # add image-page similarity and combine with any existing score
         rescored = []
         for s in snippets:
             meta = s.get("metadata", {})
@@ -609,6 +657,7 @@ def run_agentic_rag():
                 img_sim = index.query_score(question, doc_id, page)
             except Exception:
                 img_sim = 0.0
+            # blend: 70% ColPali sim, 30% previous score (if any)
             prev = float(s.get("score", 0.0))
             blended = 0.7 * img_sim + 0.3 * prev
             s2 = dict(s)
@@ -622,6 +671,7 @@ def run_agentic_rag():
         snippets = state.get("retrieved_docs", []) or []
         if not snippets:
             return {"retrieved_docs": []}
+        # First: learned text reranker if available
         clf = st.session_state.get("reranker_model")
         emb_model = state.get("embeddings_model")
         if clf is not None and SKLEARN_AVAILABLE:
@@ -633,6 +683,7 @@ def run_agentic_rag():
                 if hasattr(clf, "predict_proba"):
                     probs = clf.predict_proba(np.array(X))[:, 1]
                 elif hasattr(clf, "decision_function"):
+                    # map decision scores to [0,1] with a simple sigmoid
                     scores = clf.decision_function(np.array(X))
                     probs = 1 / (1 + np.exp(-scores))
                 elif hasattr(clf, "predict"):
@@ -644,12 +695,14 @@ def run_agentic_rag():
                     s["score"] = float(probs[i])
             except Exception:
                 pass
+        # Then: optional ColPali hybrid re-scoring
         try:
             user_id = state.get("user_id", "anon")
             file_hash = state.get("file_hash", "global")
             snippets = colpali_hybrid_score(snippets, state.get("question", ""), user_id, file_hash)
         except Exception:
             pass
+        # final sort
         snippets.sort(key=lambda x: x.get("score", 0.0), reverse=True)
         return {"retrieved_docs": snippets}
 
@@ -660,11 +713,11 @@ def run_agentic_rag():
             return {"retrieved_docs": snippets}
         scored = []
         prompt = PromptTemplate(
-            template='''You are an evaluator. For the given question and snippet return a JSON object {"confidence": <float 0.0-1.0>} estimating how well the snippet answers the question. Respond ONLY with the JSON.
+            template="""You are an evaluator. For the given question and snippet return a JSON object {"confidence": <float 0.0-1.0>} estimating how well the snippet answers the question. Respond ONLY with the JSON.
 
 Question: {question}
 Snippet:
-{snippet}''',
+{snippet}""",
             input_variables=["question", "snippet"],
         )
         for s in snippets:
@@ -676,7 +729,9 @@ Snippet:
             except Exception:
                 conf = 0.0
             s_copy = dict(s)
+            # don't override ColPali-based blended score; instead keep as additional field
             s_copy["llm_conf"] = conf
+            # combine lightly for ordering if there was no earlier score
             if "score" not in s_copy:
                 s_copy["score"] = conf
             scored.append(s_copy)
@@ -685,13 +740,13 @@ Snippet:
 
     def evaluate_node(state: State) -> Dict[str, Any]:
         prompt = PromptTemplate(
-            template='''You are a grader assessing the relevance of retrieved snippets to a user question.
+            template="""You are a grader assessing the relevance of retrieved snippets to a user question.
 Aggregate the relevance of all snippets and provide a single confidence score from 0.0 to 1.0.
 Respond ONLY with a JSON object containing a single key "confidence".
 
 Question: {question}
 Snippets:
-{snippets}''',
+{snippets}""",
             input_variables=["question", "snippets"],
         )
         evaluator_chain = prompt | state["llm"] | JsonOutputParser()
@@ -707,8 +762,6 @@ Snippets:
     def web_search_node(state: State) -> Dict[str, Any]:
         hits = []
         try:
-            if web_search_tool is None:
-                return {"web_results": []}
             results = web_search_tool.invoke({"query": state["question"]})
             hits = [r.get("content", "") for r in results if isinstance(r, dict) and r.get("content")]
         except Exception:
@@ -731,8 +784,8 @@ Snippets:
                     buf += piece
                     placeholder.markdown(buf)
                 return buf
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"streaming error: {e}")
         out = None
         try:
             out = llm.invoke(prompt)
@@ -757,6 +810,7 @@ Snippets:
             context = "\n\n".join(state.get("web_results", []))
         else:
             return {"answer": "I couldn't find any relevant information in the PDFs or online."}
+
         prompt = (
             f"You are a helpful assistant. Answer the question using only the context below. "
             f"If no answer can be found, say so.\n\n"
@@ -771,15 +825,18 @@ Snippets:
                 st.session_state[placeholder_key] = placeholder
             ans = stream_answer(state["llm"], prompt, placeholder)
             return {"answer": ans}
-        except Exception:
+        except Exception as e:
+            print(f"generate_node error: {e}")
             try:
                 response = state["llm"].invoke(prompt)
                 ans = getattr(response, "content", str(response))
                 return {"answer": ans}
-            except Exception:
+            except Exception as e2:
+                print(f"generate_node fallback error: {e2}")
                 return {"answer": "An error occurred while generating the answer."}
 
     def summarize_node(state: State) -> Dict[str, Any]:
+        # Concatenate all parsed text and ask the LLM to summarize.
         doc_text = ""
         for d in state.get("documents", []):
             try:
@@ -789,57 +846,62 @@ Snippets:
                     doc_text += page_text + "\n\n"
             except Exception:
                 pass
+        # keep context size bounded
         prompt = f"Summarize the following documents. Keep the summary concise but complete, include section headings if helpful.\n\n{doc_text[:15000]}"
         try:
             response = state["llm"].invoke(prompt)
             ans = getattr(response, "content", str(response))
             return {"answer": ans}
-        except Exception:
+        except Exception as e:
+            print(f"summarize_node error: {e}")
             return {"answer": "An error occurred while summarizing the document."}
 
+    # Build workflow
     workflow = StateGraph(State)
-# PART 2
-workflow.add_node("initialize_models", initialize_models_node)
-workflow.add_node("load_and_chunk_docs", load_and_chunk_docs_node)
-workflow.add_node("create_chroma_index", create_chroma_index_node)
-workflow.add_node("retrieve", retrieve_node)
-workflow.add_node("rerank", rerank_node)
-workflow.add_node("score_snippets", score_snippets_node)
-workflow.add_node("evaluate", evaluate_node)
-workflow.add_node("web_search", web_search_node)
-workflow.add_node("generate", generate_node)
-workflow.add_node("summarize", summarize_node)
+    workflow.add_node("initialize_models", initialize_models_node)
+    workflow.add_node("load_and_chunk_docs", load_and_chunk_docs_node)
+    workflow.add_node("create_chroma_index", create_chroma_index_node)
+    workflow.add_node("retrieve", retrieve_node)
+    workflow.add_node("rerank", rerank_node)
+    workflow.add_node("score_snippets", score_snippets_node)
+    workflow.add_node("evaluate", evaluate_node)
+    workflow.add_node("web_search", web_search_node)
+    workflow.add_node("generate", generate_node)
+    workflow.add_node("summarize", summarize_node)
 
-workflow.set_entry_point("initialize_models")
-workflow.add_edge("initialize_models", "load_and_chunk_docs")
-workflow.add_edge("load_and_chunk_docs", "create_chroma_index")
-workflow.add_edge("create_chroma_index", "retrieve")
+    workflow.set_entry_point("initialize_models")
+    workflow.add_edge("initialize_models", "load_and_chunk_docs")
+    workflow.add_edge("load_and_chunk_docs", "create_chroma_index")
+    workflow.add_edge("create_chroma_index", "retrieve")
 
-def route_after_retrieval(state: State):
-    return "summarize" if state["question"].lower().strip() == "summarize" else "rerank"
+    def route_after_retrieval(state: State):
+        return "summarize" if state["question"].lower().strip() == "summarize" else "rerank"
 
-def route_after_evaluation(state: State):
-    return "generate" if state.get("confidence", 0.0) >= 0.6 else "web_search"
+    def route_after_evaluation(state: State):
+        return "generate" if state.get("confidence", 0.0) >= 0.6 else "web_search"
 
-workflow.add_conditional_edges("retrieve", route_after_retrieval, {"summarize": "summarize", "rerank": "rerank"})
-workflow.add_edge("rerank", "score_snippets")
-workflow.add_edge("score_snippets", "evaluate")
-workflow.add_conditional_edges("evaluate", route_after_evaluation, {"generate": "generate", "web_search": "web_search"})
-workflow.add_edge("web_search", "generate")
-workflow.add_edge("generate", END)
-workflow.add_edge("summarize", END)
+    workflow.add_conditional_edges("retrieve", route_after_retrieval, {"summarize": "summarize", "rerank": "rerank"})
+    workflow.add_edge("rerank", "score_snippets")
+    workflow.add_edge("score_snippets", "evaluate")
+    workflow.add_conditional_edges("evaluate", route_after_evaluation, {"generate": "generate", "web_search": "web_search"})
+    workflow.add_edge("web_search", "generate")
+    workflow.add_edge("generate", END)
+    workflow.add_edge("summarize", END)
+    return workflow.compile()
 
-rag_app_compiled = workflow.compile()
-
+# ---------- small async wrapper ----------
 async def get_rag_response(rag_app, initial_state):
     return await rag_app.ainvoke(initial_state)
 
+# ---------- keep original train_reranker_from_feedback API ----------
 def train_reranker_from_feedback():
     current_user = st.session_state.get("user_id")
     if current_user is None:
         st.warning("Login first")
         return
     train_reranker_incremental(current_user)
+
+# ---------- main app UI ----------
 
 def main():
     nest_asyncio.apply()
@@ -850,6 +912,7 @@ def main():
         st.error("API keys for Gemini or Tavily are not configured.")
         st.stop()
 
+    # session defaults
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
     if "feedback_examples" not in st.session_state:
@@ -863,6 +926,7 @@ def main():
     if "username" not in st.session_state:
         st.session_state["username"] = None
 
+    # If a user is already set in session (e.g. on redeploy), load persisted chat history
     if st.session_state.get("user_id") and not st.session_state.get("chat_history"):
         try:
             load_user_chats(st.session_state.get("user_id"))
@@ -887,15 +951,19 @@ def main():
             if uid:
                 st.session_state["user_id"] = uid
                 st.session_state["username"] = auth_username.strip()
+                # load persisted chats for this user so chat history is visible after login
                 try:
                     load_user_chats(uid)
                 except Exception:
                     pass
+                # try loading any previously trained reranker model for this user
                 if SKLEARN_AVAILABLE and joblib:
                     ok, msg = load_user_reranker(uid)
+                    # msg contains path or error message
                     if ok:
                         st.session_state["last_trained_reranker"] = st.session_state.get("loaded_reranker")
                     else:
+                        # no model found or failed to load; that's fine
                         pass
                 st.success("Logged in")
             else:
@@ -914,19 +982,23 @@ def main():
         st.session_state.chat_history = []
     if sidebar.button("Clear Feedback"):
         st.session_state.feedback_examples = []
+        # also clear DB rows for user if desired
     save_path = sidebar.text_input("Model save dir", value="/tmp")
     st.session_state["reranker_path"] = save_path
 
+    # --- RERANKER MODEL MANAGEMENT UI ---
     sidebar.markdown("---")
     sidebar.subheader("Reranker model management")
     if SKLEARN_AVAILABLE and joblib:
         if st.session_state.get("user_id"):
             user_id = st.session_state.get("user_id")
+            # Upload a model file
             uploaded_model_file = sidebar.file_uploader("Upload reranker (.joblib/.pkl)", type=["joblib", "pkl"], key="upload_reranker")
             if uploaded_model_file is not None:
                 try:
                     saved_path = save_uploaded_model_file(user_id, uploaded_model_file)
                     st.success(f"Saved model to {saved_path}")
+                    # auto-load it
                     ok, msg = load_user_reranker(user_id, os.path.basename(saved_path))
                     if ok:
                         st.success("Reranker uploaded and loaded into session.")
@@ -935,6 +1007,7 @@ def main():
                 except Exception as e:
                     st.error(f"Failed to save uploaded model: {e}")
 
+            # list available models and allow selection
             models = list_user_models(user_id)
             selected_model = None
             if models:
@@ -958,6 +1031,7 @@ def main():
     else:
         sidebar.info("scikit-learn / joblib not available in this environment. Model upload / load disabled.")
 
+    # Manual feedback expander - lets user paste a snippet and label it directly
     with sidebar.expander("Manual feedback (paste snippet + label)"):
         manual_question = st.text_input("Question (optional)", key="manual_feedback_question")
         manual_snippet = st.text_area("Snippet text", key="manual_feedback_snippet", height=150)
@@ -983,6 +1057,7 @@ def main():
                     "label": label_val,
                     "ts": time.time(),
                 })
+                # Attempt to train immediately (best-effort)
                 if SKLEARN_AVAILABLE:
                     try:
                         train_reranker_incremental(current_user)
@@ -991,6 +1066,7 @@ def main():
                 else:
                     st.info("Install scikit-learn to enable retrainer training")
 
+    # show feedback count
     fb_rows = 0
     try:
         if st.session_state.get("user_id"):
@@ -1001,6 +1077,7 @@ def main():
         fb_rows = len(st.session_state.get("feedback_examples", []))
     sidebar.markdown(f"**Feedback examples:** {fb_rows}")
 
+    # Optional ColPali hybrid controls
     sidebar.markdown("---")
     colpali_enabled = sidebar.checkbox("Enable ColPali/ColQwen hybrid rerank (experimental)", value=False)
     colpali_model = sidebar.selectbox("Col model", [
@@ -1022,6 +1099,7 @@ def main():
     else:
         sidebar.info("Install scikit-learn to enable reranker training")
 
+    # handle uploaded files: if user logged in, save to per-user storage; else keep in-memory
     docs = []
     if uploaded_files:
         files_list = uploaded_files if isinstance(uploaded_files, list) else [uploaded_files]
@@ -1042,6 +1120,7 @@ def main():
                 st.error(f"Failed to save {f.name}: {e}")
         sidebar.success(f"{saved_count} file(s) processed")
 
+    # Build ColPali page-embedding index (best-effort, cached), BEFORE running graph
     if colpali_enabled and docs:
         try:
             current_user = st.session_state.get("user_id") or 0
@@ -1069,6 +1148,7 @@ def main():
     col1, col2 = st.columns([1, 2])
     with col1:
         st.subheader("Chat History")
+        # display persisted or session chat history
         if st.session_state.chat_history:
             for chat in reversed(st.session_state.chat_history[-200:]):
                 st.markdown(f"**You:** {chat.get('user','')}")
@@ -1108,7 +1188,7 @@ def main():
                     with st.spinner("Thinking..."):
                         llm, embeddings_model = ensure_models()
                         if "rag_app" not in st.session_state:
-                            st.session_state["rag_app"] = rag_app_compiled
+                            st.session_state["rag_app"] = run_agentic_rag()
                         rag_app = st.session_state["rag_app"]
                         file_hash = _short_hash_bytes_multiple(docs) if docs else _short_hash_bytes(b"no-doc")
                         initial_state = {
@@ -1120,15 +1200,19 @@ def main():
                             "user_id": current_user
                         }
                         st.session_state["last_file_hash"] = file_hash
+                        # persist user message (DB + session)
                         persist_chat(current_user, "user", user_query)
                         try:
-                            final_state = asyncio.get_event_loop().run_until_complete(get_rag_response(rag_app, initial_state))
+                            final_state = run_async(get_rag_response(rag_app, initial_state))
                             answer = final_state.get("answer", "No answer was generated.")
                             retrieved = final_state.get("retrieved_docs", [])
                             confidence = final_state.get("confidence", 0.0)
+
+                            # --- REPLACED RETRIEVED UI BLOCK (includes feedback buttons) ---
                             st.markdown("## Answer")
                             st.write(answer)
                             st.markdown(f"**Confidence:** {confidence:.2f}")
+
                             st.markdown("### Best retrieved snippet (provenance shown). Label it to improve the reranker.")
                             if retrieved:
                                 best = retrieved[0]
@@ -1143,6 +1227,7 @@ def main():
                                     st.caption(f"ColPali page-image similarity: {cps:.3f}")
                                 snippet_text = best.get("text", "")[:2500]
                                 st.write(snippet_text)
+                                # deterministic keys so Streamlit buttons work across reruns
                                 qhash = abs(hash(user_query)) if user_query else 0
                                 file_hash_short = file_hash or "nohash"
                                 rel_key = f"mark_rel_{file_hash_short}_{chunk_index}_{qhash}"
@@ -1161,6 +1246,7 @@ def main():
                                         "label": 1,
                                         "ts": time.time(),
                                     })
+                                    # Train reranker immediately after feedback (best-effort)
                                     if SKLEARN_AVAILABLE:
                                         try:
                                             train_reranker_incremental(current_user)
@@ -1181,6 +1267,7 @@ def main():
                                         "label": 0,
                                         "ts": time.time(),
                                     })
+                                    # Train reranker immediately after feedback (best-effort)
                                     if SKLEARN_AVAILABLE:
                                         try:
                                             train_reranker_incremental(current_user)
@@ -1189,6 +1276,7 @@ def main():
                                     else:
                                         st.info("Install scikit-learn to enable reranker training")
 
+                                # Also show the next-best snippets and allow quick labeling
                                 if len(retrieved) > 1:
                                     st.markdown("---")
                                     st.markdown("### Other retrieved snippets — quick label")
@@ -1200,6 +1288,7 @@ def main():
                                         st.markdown(f"**#{idx}** Source: {fname} (p.{pnum}) chunk {chunk_idx}")
                                         txt = s.get("text", "")[:2000]
                                         st.write(txt)
+                                        # deterministic keys per snippet
                                         qh = abs(hash(user_query)) if user_query else 0
                                         rel_k = f"rel_{file_hash_short}_{chunk_idx}_{qh}"
                                         notrel_k = f"notrel_{file_hash_short}_{chunk_idx}_{qh}"
@@ -1219,6 +1308,7 @@ def main():
                                                 "label": 1,
                                                 "ts": time.time(),
                                             })
+                                            # Train reranker (best-effort)
                                             if SKLEARN_AVAILABLE:
                                                 try:
                                                     train_reranker_incremental(current_user)
@@ -1241,6 +1331,7 @@ def main():
                                                 "label": 0,
                                                 "ts": time.time(),
                                             })
+                                            # Train reranker (best-effort)
                                             if SKLEARN_AVAILABLE:
                                                 try:
                                                     train_reranker_incremental(current_user)
@@ -1252,6 +1343,7 @@ def main():
                             else:
                                 st.info("No retrieved snippets to display. Consider uploading PDFs or widening your search query.")
 
+                            # persist assistant answer (DB + session)
                             try:
                                 persist_chat(current_user, "assistant", answer)
                             except Exception:
@@ -1260,6 +1352,7 @@ def main():
                         except Exception as e:
                             st.error(f"Failed to get an answer: {e}")
 
+        # ------------------ NEW: Summarize all uploaded documents ------------------
         if st.button("Summarize documents"):
             current_user = st.session_state.get("user_id")
             if not docs:
@@ -1272,7 +1365,7 @@ def main():
                 with st.spinner("Summarizing documents..."):
                     llm, embeddings_model = ensure_models()
                     if "rag_app" not in st.session_state:
-                        st.session_state["rag_app"] = rag_app_compiled
+                        st.session_state["rag_app"] = run_agentic_rag()
                     rag_app = st.session_state["rag_app"]
                     file_hash = _short_hash_bytes_multiple(docs)
                     initial_state = {
@@ -1284,16 +1377,19 @@ def main():
                         "user_id": current_user
                     }
                     st.session_state["last_file_hash"] = file_hash
+                    # persist user action (summarize) for audit
                     persist_chat(current_user, "user", "summarize")
                     try:
-                        final_state = asyncio.get_event_loop().run_until_complete(get_rag_response(rag_app, initial_state))
+                        final_state = run_async(get_rag_response(rag_app, initial_state))
                         answer = final_state.get("answer", "No summary generated.")
                         st.markdown("## Document Summary")
                         st.write(answer)
+                        # store assistant summary
                         st.session_state["chat_history"].append({"user": "summarize", "assistant": answer})
                         persist_chat(current_user, "assistant", answer)
                     except Exception as e:
                         st.error(f"Error summarizing: {e}")
 
+# If you want to run the app directly
 if __name__ == "__main__":
     main()
