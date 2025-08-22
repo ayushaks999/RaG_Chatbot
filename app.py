@@ -1,36 +1,34 @@
-# ---- FILE: app_core.py (PART 1) ----
-# Core helpers, DB, model helpers and workflow builder for Agentic RAG.
-# Place this file alongside app_ui.py (PART 2).
-
+# PART 1
+import streamlit as st
 import os
 import io
-import re
-import time
+import sys
 import json
+import re
+
+import hashlib
+from typing import List, Any, TypedDict, Dict, Tuple
+import PyPDF2
+from langgraph.graph import StateGraph, END
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
+
+import asyncio
+import nest_asyncio
+from dotenv import load_dotenv
+import numpy as np
+import time
+
 import sqlite3
 import secrets
 import base64
-import hashlib
-import asyncio
-from typing import List, Any, TypedDict, Dict, Tuple
-from datetime import datetime
-
-import numpy as np
+from datetime import datetime, timedelta
 
 try:
-    import streamlit as st
-except Exception:
-    # allow importing this module in environments without Streamlit for tests
-    st = None
-
-try:
-    import PyPDF2
-except Exception:
-    PyPDF2 = None
-
-# Optional heavy backends - fail gracefully if not present
-try:
-    import torch  # noqa: F401
+    import torch
     from colpali_engine.models import ColPali, ColQwen, ColSmol
     from pdf2image import convert_from_bytes
     COLPALI_AVAILABLE = True
@@ -38,7 +36,7 @@ except Exception:
     COLPALI_AVAILABLE = False
 
 try:
-    import pytesseract  # noqa: F401
+    import pytesseract
     PYTESS_AVAILABLE = True
 except Exception:
     PYTESS_AVAILABLE = False
@@ -57,41 +55,14 @@ try:
 except Exception:
     TIKTOKEN_AVAILABLE = False
 
-# Third-party LLM/embedding wrappers (lazy-import since environments vary)
-try:
-    from langgraph.graph import StateGraph, END
-    from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-    from langchain_community.vectorstores import Chroma
-    from langchain_community.tools.tavily_search import TavilySearchResults
-    from langchain_core.prompts import PromptTemplate
-    from langchain_core.output_parsers import JsonOutputParser
-except Exception:
-    # keep names defined so module import doesn't fail; runtime code will check availability
-    StateGraph = None
-    END = None
-    ChatGoogleGenerativeAI = None
-    GoogleGenerativeAIEmbeddings = None
-    Chroma = None
-    TavilySearchResults = None
-    PromptTemplate = None
-    JsonOutputParser = None
+load_dotenv()
 
-# environment / storage defaults (override via env or Streamlit secrets)
-DB_PATH = os.environ.get("AGENTIC_RAG_DB_PATH", "/tmp/agentic_rag.db")
-STORAGE_ROOT = os.environ.get("AGENTIC_RAG_STORAGE", "/tmp/agentic_rag_storage")
-os.makedirs(STORAGE_ROOT, exist_ok=True)
-
-MAX_UPLOAD_BYTES = int(os.environ.get("AGENTIC_RAG_MAX_UPLOAD_BYTES", 10 * 1024 * 1024))
-RATE_LIMIT_N = int(os.environ.get("AGENTIC_RAG_RATE_LIMIT_N", "30"))
-
-# ---------- basic secrets helpers ----------
 def _get_secret(name: str):
-    # prefer environment, then Streamlit secrets if available
     val = os.environ.get(name)
     if val:
         return val
     try:
-        if st and hasattr(st, "secrets") and st.secrets.get(name):
+        if hasattr(st, "secrets") and st.secrets.get(name):
             return st.secrets.get(name)
     except Exception:
         pass
@@ -100,17 +71,35 @@ def _get_secret(name: str):
 GEMINI_API_KEY = _get_secret("GEMINI_API_KEY")
 TAVILY_API_KEY = _get_secret("TAVILY_API_KEY")
 
-# ---------- small helpers ----------
 def _short_hash_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()[:12]
 
-def _short_hash_bytes_multiple(docs: List[Dict[str, Any]]) -> str:
-    m = hashlib.sha256()
-    for d in docs:
-        m.update(d.get("file_content", b""))
-    return m.hexdigest()[:12]
+async def run_async(coro):
+    try:
+        return await coro
+    except Exception:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, lambda: None)
 
-# ---------- DB init / persistence ----------
+class State(TypedDict):
+    documents: List[Dict[str, Any]]
+    question: str
+    llm: Any
+    embeddings_model: Any
+    full_document_text: str
+    text_chunks: List[Dict[str, Any]]
+    vector_store: Any
+    retrieved_docs: List[Dict[str, Any]]
+    confidence: float
+    web_results: List[str]
+    answer: str
+    file_hash: str
+    user_id: int
+
+DB_PATH = os.environ.get("AGENTIC_RAG_DB_PATH", "/tmp/agentic_rag.db")
+STORAGE_ROOT = os.environ.get("AGENTIC_RAG_STORAGE", "/tmp/agentic_rag_storage")
+os.makedirs(STORAGE_ROOT, exist_ok=True)
+
 def init_db(db_path=DB_PATH):
     conn = sqlite3.connect(db_path, check_same_thread=False)
     c = conn.cursor()
@@ -152,14 +141,11 @@ def init_db(db_path=DB_PATH):
 
 _db_conn = init_db()
 
-# ---------- auth helpers ----------
-
 def _hash_password(password: str, salt: str = None):
     if salt is None:
         salt = secrets.token_hex(16)
     pwd = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000)
     return pwd.hex(), salt
-
 
 def create_user(username: str, password: str):
     c = _db_conn.cursor()
@@ -170,7 +156,6 @@ def create_user(username: str, password: str):
         return True, None
     except sqlite3.IntegrityError:
         return False, "username already exists"
-
 
 def verify_user(username: str, password: str):
     c = _db_conn.cursor()
@@ -184,7 +169,8 @@ def verify_user(username: str, password: str):
         return uid
     return None
 
-# ---------- rate limiter (simple, per-minute) ----------
+RATE_LIMIT_N = int(os.environ.get("AGENTIC_RAG_RATE_LIMIT_N", "30"))
+
 def check_rate_limit(user_id: int):
     now = time.time()
     c = _db_conn.cursor()
@@ -206,11 +192,10 @@ def check_rate_limit(user_id: int):
     _db_conn.commit()
     return True
 
-# ---------- file sanitization and saving ----------
-
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[^A-Za-z0-9_.-]', '_', name)
 
+MAX_UPLOAD_BYTES = int(os.environ.get("AGENTIC_RAG_MAX_UPLOAD_BYTES", 10 * 1024 * 1024))
 
 def save_uploaded_file(user_id: int, uploaded_file):
     raw = uploaded_file.getvalue()
@@ -229,13 +214,10 @@ def save_uploaded_file(user_id: int, uploaded_file):
     _db_conn.commit()
     return {"path": path, "file_hash": file_hash, "filename": safe_name, "raw": raw}
 
-# ---------- model file helpers (for reranker management) ----------
-
 def get_user_model_dir(user_id: int) -> str:
     user_model_dir = os.path.join(STORAGE_ROOT, f"user_{user_id}", "models")
     os.makedirs(user_model_dir, exist_ok=True)
     return user_model_dir
-
 
 def list_user_models(user_id: int) -> List[str]:
     d = get_user_model_dir(user_id)
@@ -245,7 +227,6 @@ def list_user_models(user_id: int) -> List[str]:
     except Exception:
         return []
 
-
 def save_uploaded_model_file(user_id: int, uploaded_file) -> str:
     data = uploaded_file.getvalue()
     fname = sanitize_filename(uploaded_file.name)
@@ -254,7 +235,6 @@ def save_uploaded_model_file(user_id: int, uploaded_file) -> str:
     with open(path, "wb") as fh:
         fh.write(data)
     return path
-
 
 def load_user_reranker(user_id: int, fname: str = None) -> Tuple[bool, str]:
     if not SKLEARN_AVAILABLE or joblib is None:
@@ -271,14 +251,11 @@ def load_user_reranker(user_id: int, fname: str = None) -> Tuple[bool, str]:
         return False, "no reranker model found for user"
     try:
         clf = joblib.load(path)
-        if st:
-            st.session_state["reranker_model"] = clf
-            st.session_state["loaded_reranker"] = path
+        st.session_state["reranker_model"] = clf
+        st.session_state["loaded_reranker"] = path
         return True, path
     except Exception as e:
         return False, f"failed to load model: {e}"
-
-# ---------- embedding cache helper ----------
 
 def embed_texts_wrap(emb_model, texts):
     try:
@@ -291,7 +268,6 @@ def embed_texts_wrap(emb_model, texts):
                 return np.array([emb_model.encode(t) for t in texts])
             except Exception:
                 return np.zeros((len(texts), 768))
-
 
 def embed_texts_cached(emb_model, texts, user_id, file_hash):
     cache_dir = os.path.join(STORAGE_ROOT, f"user_{user_id}", "emb_cache", file_hash)
@@ -307,8 +283,6 @@ def embed_texts_cached(emb_model, texts, user_id, file_hash):
         return X
     except Exception:
         return embed_texts_wrap(emb_model, texts)
-
-# ---------- ColPali helpers (optional + crash-proof) ----------
 
 def colpali_device():
     try:
@@ -358,7 +332,6 @@ class ColpaliIndex:
             return False
         try:
             for i, d in enumerate(docs):
-                # render pages on the fly, low DPI to avoid OOM
                 pages = convert_from_bytes(d["file_content"], dpi=110, fmt="png")
                 for p_idx, img in enumerate(pages, start=1):
                     key = self._page_key(i, p_idx)
@@ -398,24 +371,20 @@ class ColpaliIndex:
         except Exception:
             return 0.0
 
-# ---------- reranker incremental training ----------
-
 def train_reranker_incremental(user_id:int):
     if not SKLEARN_AVAILABLE:
-        if st:
-            st.warning("scikit-learn not available in the environment")
+        st.warning("scikit-learn not available in the environment")
         return
     c = _db_conn.cursor()
     c.execute("SELECT question, snippet, label FROM feedback WHERE user_id=?", (user_id,))
     rows = c.fetchall()
     if not rows:
-        if st:
-            st.warning("No feedback examples to train on")
+        st.warning("No feedback examples to train on")
         return
     texts = [r[1] for r in rows]
     labels = [r[2] for r in rows]
-    emb_model = st.session_state.get("embeddings_model") if st else None
-    file_hash = st.session_state.get("last_file_hash", "global") if st else "global"
+    emb_model = st.session_state.get("embeddings_model")
+    file_hash = st.session_state.get("last_file_hash", "global")
     X = embed_texts_cached(emb_model, texts, user_id, f"{file_hash}_feedback")
     user_model_dir = get_user_model_dir(user_id)
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -436,19 +405,14 @@ def train_reranker_incremental(user_id:int):
         if joblib:
             joblib.dump(clf, model_path_ts)
             joblib.dump(clf, model_path_stable)
-            if st:
-                st.success(f"Reranker trained and saved to {model_path_ts}")
-                st.session_state["reranker_model"] = clf
-                st.session_state["last_trained_reranker"] = model_path_ts
-                st.session_state["loaded_reranker"] = model_path_stable
+            st.success(f"Reranker trained and saved to {model_path_ts}")
+            st.session_state["reranker_model"] = clf
+            st.session_state["last_trained_reranker"] = model_path_ts
+            st.session_state["loaded_reranker"] = model_path_stable
         else:
-            if st:
-                st.warning("joblib not available; trained model not saved to disk")
+            st.warning("joblib not available; trained model not saved to disk")
     except Exception as e:
-        if st:
-            st.error(f"Failed to train reranker incrementally: {e}")
-
-# ---------- persistence helpers for UI ----------
+        st.error(f"Failed to train reranker incrementally: {e}")
 
 def persist_chat(user_id:int, role:str, content:str):
     try:
@@ -459,19 +423,17 @@ def persist_chat(user_id:int, role:str, content:str):
     except Exception:
         pass
     try:
-        if st and "chat_history" not in st.session_state:
+        if "chat_history" not in st.session_state:
             st.session_state["chat_history"] = []
-        if st:
-            if role == "user":
-                st.session_state["chat_history"].append({"user": content, "assistant": ""})
-            elif role == "assistant":
-                if st.session_state["chat_history"] and st.session_state["chat_history"][-1].get("assistant", "") == "":
-                    st.session_state["chat_history"][-1]["assistant"] = content
-                else:
-                    st.session_state["chat_history"].append({"user": "", "assistant": content})
+        if role == "user":
+            st.session_state["chat_history"].append({"user": content, "assistant": ""})
+        elif role == "assistant":
+            if st.session_state["chat_history"] and st.session_state["chat_history"][-1].get("assistant", "") == "":
+                st.session_state["chat_history"][-1]["assistant"] = content
+            else:
+                st.session_state["chat_history"].append({"user": "", "assistant": content})
     except Exception:
         pass
-
 
 def load_user_chats(user_id: int, limit: int = 500):
     try:
@@ -488,71 +450,67 @@ def load_user_chats(user_id: int, limit: int = 500):
                 pending_user = None
         if pending_user is not None:
             conv.append({"user": pending_user, "assistant": ""})
-        if st:
-            st.session_state["chat_history"] = conv
+        st.session_state["chat_history"] = conv
     except Exception:
-        if st and "chat_history" not in st.session_state:
+        if "chat_history" not in st.session_state:
             st.session_state["chat_history"] = []
 
-# ---------- ensure models helper (lazy init) ----------
 def ensure_models():
-    if not st:
-        raise RuntimeError("Streamlit not available in this environment")
     if "llm" not in st.session_state or "embeddings_model" not in st.session_state:
         if not GEMINI_API_KEY:
-            st.error("GEMINI_API_KEY not found.")
+            st.error("GEMINI_API_KEY not found. Please set it in environment or Streamlit secrets.")
             st.stop()
         st.session_state["llm"] = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=GEMINI_API_KEY)
         st.session_state["embeddings_model"] = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GEMINI_API_KEY)
     return st.session_state["llm"], st.session_state["embeddings_model"]
 
-# ---------- RAG workflow builder ----------
+def _short_hash_bytes_multiple(docs: List[Dict[str, Any]]) -> str:
+    m = hashlib.sha256()
+    for d in docs:
+        m.update(d["file_content"])
+    return m.hexdigest()[:12]
 
 def run_agentic_rag():
-    if StateGraph is None:
-        raise RuntimeError("langgraph StateGraph is not available in the environment")
+    web_search_tool = TavilySearchResults(max_results=4, tavily_api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 
-    web_search_tool = TavilySearchResults(max_results=4, tavily_api_key=TAVILY_API_KEY) if TavilySearchResults else None
-
-    # nodes are defined here as in your original code; for brevity we keep the same structure
-    def initialize_models_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    def initialize_models_node(state: State) -> Dict[str, Any]:
         if state.get("llm") and state.get("embeddings_model"):
             return {}
-        if st and "llm" in st.session_state and "embeddings_model" in st.session_state:
+        if "llm" in st.session_state and "embeddings_model" in st.session_state:
             return {"llm": st.session_state["llm"], "embeddings_model": st.session_state["embeddings_model"]}
         llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=GEMINI_API_KEY)
         embeddings_model = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GEMINI_API_KEY)
         return {"llm": llm, "embeddings_model": embeddings_model}
 
-    def load_and_chunk_docs_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    def load_and_chunk_docs_node(state: State) -> Dict[str, Any]:
         out_chunks = []
         docs = state.get("documents", []) or []
         for i, doc in enumerate(docs):
             try:
-                reader = PyPDF2.PdfReader(io.BytesIO(doc["file_content"])) if PyPDF2 else None
-                if reader:
-                    for p, page in enumerate(reader.pages):
-                        page_text = page.extract_text() or ""
-                        if not page_text.strip() and PYTESS_AVAILABLE:
-                            try:
-                                from pdf2image import convert_from_bytes
-                                imgs = convert_from_bytes(doc["file_content"], dpi=110, first_page=p+1, last_page=p+1)
-                                if imgs:
-                                    page_text = pytesseract.image_to_string(imgs[0]) or ""
-                            except Exception:
-                                pass
-                        out_chunks.append({
-                            "text": page_text or "",
-                            "doc_id": i,
-                            "filename": doc.get("filename", f"doc_{i}"),
-                            "page": p + 1
-                        })
-                else:
-                    out_chunks.append({"text": "", "doc_id": i, "filename": doc.get("filename", f"doc_{i}"), "page": 0})
+                reader = PyPDF2.PdfReader(io.BytesIO(doc["file_content"]))
+                for p, page in enumerate(reader.pages):
+                    page_text = page.extract_text() or ""
+                    if not page_text.strip() and PYTESS_AVAILABLE:
+                        try:
+                            from pdf2image import convert_from_bytes
+                            imgs = convert_from_bytes(doc["file_content"], dpi=110, first_page=p+1, last_page=p+1)
+                            if imgs:
+                                page_text = pytesseract.image_to_string(imgs[0]) or ""
+                        except Exception:
+                            pass
+                    out_chunks.append({
+                        "text": page_text or "",
+                        "doc_id": i,
+                        "filename": doc.get("filename", f"doc_{i}"),
+                        "page": p + 1
+                    })
             except Exception:
-                out_chunks.append({"text": "", "doc_id": i, "filename": doc.get("filename", f"doc_{i}"), "page": 0})
-
-        # chunking
+                out_chunks.append({
+                    "text": "",
+                    "doc_id": i,
+                    "filename": doc.get("filename", f"doc_{i}"),
+                    "page": 0
+                })
         max_tokens = 1000
         overlap = 200
         combined = []
@@ -573,23 +531,30 @@ def run_agentic_rag():
         chunk_size = 2000
         overlap_chars = 400
         for c in out_chunks:
-            t = c["text"] or ""
+            t = c["text"]
+            if t is None:
+                t = ""
             if not t:
                 combined.append({"text": "", "doc_id": c["doc_id"], "filename": c["filename"], "page": c["page"]})
                 continue
             for start in range(0, len(t), chunk_size - overlap_chars):
-                combined.append({"text": t[start:start + chunk_size], "doc_id": c["doc_id"], "filename": c["filename"], "page": c["page"]})
+                combined.append({
+                    "text": t[start:start + chunk_size],
+                    "doc_id": c["doc_id"],
+                    "filename": c["filename"],
+                    "page": c["page"]
+                })
         return {"text_chunks": combined}
 
-    def create_chroma_index_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    def create_chroma_index_node(state: State) -> Dict[str, Any]:
         try:
             file_hash = state.get("file_hash")
             user_id = state.get("user_id", "anon")
             cache_key = f"chroma_{user_id}_{file_hash}" if file_hash else None
-            if cache_key and st and cache_key in st.session_state:
+            if cache_key and cache_key in st.session_state:
                 return {"vector_store": st.session_state[cache_key]}
             chunks = state.get("text_chunks", []) or []
-            if not chunks or not state.get("embeddings_model") or Chroma is None:
+            if not chunks or not state.get("embeddings_model"):
                 return {"vector_store": None}
             texts = [c["text"] for c in chunks]
             metadatas = [{"doc_id": c["doc_id"], "filename": c["filename"], "page": c["page"], "chunk_index": idx} for idx, c in enumerate(chunks)]
@@ -597,23 +562,22 @@ def run_agentic_rag():
             os.makedirs(persist_dir, exist_ok=True)
             try:
                 vector_store = Chroma.from_texts(texts=texts, embedding=state["embeddings_model"], metadatas=metadatas, persist_directory=persist_dir)
-                try:
-                    if hasattr(vector_store, "persist"):
+                if hasattr(vector_store, "persist"):
+                    try:
                         vector_store.persist()
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
             except TypeError:
                 vector_store = Chroma.from_texts(texts=texts, embedding=state["embeddings_model"], metadatas=metadatas)
-            if cache_key and st:
+            if cache_key:
                 st.session_state[cache_key] = vector_store
-            if st:
-                st.session_state["chunk_store"] = chunks
+            st.session_state["chunk_store"] = chunks
             return {"vector_store": vector_store}
         except Exception as e:
             print(f"create_chroma_index_node error: {e}")
             return {"vector_store": None}
 
-    def retrieve_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    def retrieve_node(state: State) -> Dict[str, Any]:
         if state.get("vector_store") is None:
             return {"retrieved_docs": []}
         try:
@@ -630,7 +594,7 @@ def run_agentic_rag():
             return {"retrieved_docs": []}
 
     def colpali_hybrid_score(snippets: List[Dict[str, Any]], question: str, user_id: int, file_hash: str) -> List[Dict[str, Any]]:
-        cfg = st.session_state.get("colpali_cfg") if st else None
+        cfg = st.session_state.get("colpali_cfg")
         if not cfg or not cfg.get("enabled"):
             return snippets
         index: ColpaliIndex = cfg.get("index")
@@ -654,11 +618,11 @@ def run_agentic_rag():
         rescored.sort(key=lambda x: x.get("score", 0.0), reverse=True)
         return rescored
 
-    def rerank_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    def rerank_node(state: State) -> Dict[str, Any]:
         snippets = state.get("retrieved_docs", []) or []
         if not snippets:
             return {"retrieved_docs": []}
-        clf = st.session_state.get("reranker_model") if st else None
+        clf = st.session_state.get("reranker_model")
         emb_model = state.get("embeddings_model")
         if clf is not None and SKLEARN_AVAILABLE:
             texts = [s.get("text", "") for s in snippets]
@@ -689,18 +653,18 @@ def run_agentic_rag():
         snippets.sort(key=lambda x: x.get("score", 0.0), reverse=True)
         return {"retrieved_docs": snippets}
 
-    def score_snippets_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    def score_snippets_node(state: State) -> Dict[str, Any]:
         snippets = state.get("retrieved_docs", []) or []
         llm = state.get("llm")
-        if not snippets or not llm or PromptTemplate is None:
+        if not snippets or not llm:
             return {"retrieved_docs": snippets}
         scored = []
         prompt = PromptTemplate(
-            template="""You are an evaluator. For the given question and snippet return a JSON object {\"confidence\": <float 0.0-1.0>} estimating how well the snippet answers the question. Respond ONLY with the JSON.
+            template='''You are an evaluator. For the given question and snippet return a JSON object {"confidence": <float 0.0-1.0>} estimating how well the snippet answers the question. Respond ONLY with the JSON.
 
 Question: {question}
 Snippet:
-{snippet}""",
+{snippet}''',
             input_variables=["question", "snippet"],
         )
         for s in snippets:
@@ -719,17 +683,15 @@ Snippet:
         scored.sort(key=lambda x: x.get("score", 0.0), reverse=True)
         return {"retrieved_docs": scored}
 
-    def evaluate_node(state: Dict[str, Any]) -> Dict[str, Any]:
-        if PromptTemplate is None:
-            return {"confidence": 0.0}
+    def evaluate_node(state: State) -> Dict[str, Any]:
         prompt = PromptTemplate(
-            template="""You are a grader assessing the relevance of retrieved snippets to a user question.
+            template='''You are a grader assessing the relevance of retrieved snippets to a user question.
 Aggregate the relevance of all snippets and provide a single confidence score from 0.0 to 1.0.
-Respond ONLY with a JSON object containing a single key \"confidence\".
+Respond ONLY with a JSON object containing a single key "confidence".
 
 Question: {question}
 Snippets:
-{snippets}""",
+{snippets}''',
             input_variables=["question", "snippets"],
         )
         evaluator_chain = prompt | state["llm"] | JsonOutputParser()
@@ -742,7 +704,7 @@ Snippets:
             confidence = 0.0
         return {"confidence": confidence}
 
-    def web_search_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    def web_search_node(state: State) -> Dict[str, Any]:
         hits = []
         try:
             if web_search_tool is None:
@@ -767,8 +729,7 @@ Snippets:
                 for part in stream:
                     piece = getattr(part, "content", None) or str(part)
                     buf += piece
-                    if placeholder:
-                        placeholder.markdown(buf)
+                    placeholder.markdown(buf)
                 return buf
             except Exception:
                 pass
@@ -782,12 +743,11 @@ Snippets:
         buf = ""
         for s in sentences:
             buf += s + " "
-            if placeholder:
-                placeholder.markdown(buf)
+            placeholder.markdown(buf)
             time.sleep(0.12)
         return buf
 
-    def generate_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    def generate_node(state: State) -> Dict[str, Any]:
         retrieved = state.get("retrieved_docs", []) or []
         context = ""
         if retrieved and isinstance(retrieved, list):
@@ -797,7 +757,6 @@ Snippets:
             context = "\n\n".join(state.get("web_results", []))
         else:
             return {"answer": "I couldn't find any relevant information in the PDFs or online."}
-
         prompt = (
             f"You are a helpful assistant. Answer the question using only the context below. "
             f"If no answer can be found, say so.\n\n"
@@ -806,8 +765,8 @@ Snippets:
         )
         try:
             placeholder_key = f"stream_placeholder_{state.get('file_hash','')}_{hash(state['question'])}"
-            placeholder = st.session_state.get(placeholder_key) if st else None
-            if placeholder is None and st:
+            placeholder = st.session_state.get(placeholder_key)
+            if placeholder is None:
                 placeholder = st.empty()
                 st.session_state[placeholder_key] = placeholder
             ans = stream_answer(state["llm"], prompt, placeholder)
@@ -820,15 +779,14 @@ Snippets:
             except Exception:
                 return {"answer": "An error occurred while generating the answer."}
 
-    def summarize_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    def summarize_node(state: State) -> Dict[str, Any]:
         doc_text = ""
         for d in state.get("documents", []):
             try:
-                reader = PyPDF2.PdfReader(io.BytesIO(d["file_content"])) if PyPDF2 else None
-                if reader:
-                    for p in reader.pages:
-                        page_text = p.extract_text() or ""
-                        doc_text += page_text + "\n\n"
+                reader = PyPDF2.PdfReader(io.BytesIO(d["file_content"]))
+                for p in reader.pages:
+                    page_text = p.extract_text() or ""
+                    doc_text += page_text + "\n\n"
             except Exception:
                 pass
         prompt = f"Summarize the following documents. Keep the summary concise but complete, include section headings if helpful.\n\n{doc_text[:15000]}"
@@ -839,64 +797,42 @@ Snippets:
         except Exception:
             return {"answer": "An error occurred while summarizing the document."}
 
-    # Build workflow
-    workflow = StateGraph(StateDict := TypedDict('State', {'documents': list, 'question': str, 'llm': object, 'embeddings_model': object, 'full_document_text': str, 'text_chunks': list, 'vector_store': object, 'retrieved_docs': list, 'confidence': float, 'web_results': list, 'answer': str, 'file_hash': str, 'user_id': int}))
-    workflow.add_node("initialize_models", initialize_models_node)
-    workflow.add_node("load_and_chunk_docs", load_and_chunk_docs_node)
-    workflow.add_node("create_chroma_index", create_chroma_index_node)
-    workflow.add_node("retrieve", retrieve_node)
-    workflow.add_node("rerank", rerank_node)
-    workflow.add_node("score_snippets", score_snippets_node)
-    workflow.add_node("evaluate", evaluate_node)
-    workflow.add_node("web_search", web_search_node)
-    workflow.add_node("generate", generate_node)
-    workflow.add_node("summarize", summarize_node)
+    workflow = StateGraph(State)
+# PART 2
+workflow.add_node("initialize_models", initialize_models_node)
+workflow.add_node("load_and_chunk_docs", load_and_chunk_docs_node)
+workflow.add_node("create_chroma_index", create_chroma_index_node)
+workflow.add_node("retrieve", retrieve_node)
+workflow.add_node("rerank", rerank_node)
+workflow.add_node("score_snippets", score_snippets_node)
+workflow.add_node("evaluate", evaluate_node)
+workflow.add_node("web_search", web_search_node)
+workflow.add_node("generate", generate_node)
+workflow.add_node("summarize", summarize_node)
 
-    workflow.set_entry_point("initialize_models")
-    workflow.add_edge("initialize_models", "load_and_chunk_docs")
-    workflow.add_edge("load_and_chunk_docs", "create_chroma_index")
-    workflow.add_edge("create_chroma_index", "retrieve")
+workflow.set_entry_point("initialize_models")
+workflow.add_edge("initialize_models", "load_and_chunk_docs")
+workflow.add_edge("load_and_chunk_docs", "create_chroma_index")
+workflow.add_edge("create_chroma_index", "retrieve")
 
-    def route_after_retrieval(state: Dict[str, Any]):
-        return "summarize" if state["question"].lower().strip() == "summarize" else "rerank"
+def route_after_retrieval(state: State):
+    return "summarize" if state["question"].lower().strip() == "summarize" else "rerank"
 
-    def route_after_evaluation(state: Dict[str, Any]):
-        return "generate" if state.get("confidence", 0.0) >= 0.6 else "web_search"
+def route_after_evaluation(state: State):
+    return "generate" if state.get("confidence", 0.0) >= 0.6 else "web_search"
 
-    workflow.add_conditional_edges("retrieve", route_after_retrieval, {"summarize": "summarize", "rerank": "rerank"})
-    workflow.add_edge("rerank", "score_snippets")
-    workflow.add_edge("score_snippets", "evaluate")
-    workflow.add_conditional_edges("evaluate", route_after_evaluation, {"generate": "generate", "web_search": "web_search"})
-    workflow.add_edge("web_search", "generate")
-    workflow.add_edge("generate", END)
-    workflow.add_edge("summarize", END)
-    return workflow.compile()
+workflow.add_conditional_edges("retrieve", route_after_retrieval, {"summarize": "summarize", "rerank": "rerank"})
+workflow.add_edge("rerank", "score_snippets")
+workflow.add_edge("score_snippets", "evaluate")
+workflow.add_conditional_edges("evaluate", route_after_evaluation, {"generate": "generate", "web_search": "web_search"})
+workflow.add_edge("web_search", "generate")
+workflow.add_edge("generate", END)
+workflow.add_edge("summarize", END)
 
-# ---------- small async wrapper ----------
+rag_app_compiled = workflow.compile()
+
 async def get_rag_response(rag_app, initial_state):
     return await rag_app.ainvoke(initial_state)
-
-# expose helpful utilities to UI file
-__all__ = [
-    "init_db", "_get_secret", "GEMINI_API_KEY", "TAVILY_API_KEY",
-    "save_uploaded_file", "get_user_model_dir", "list_user_models", "save_uploaded_model_file", "load_user_reranker",
-    "train_reranker_incremental", "persist_chat", "load_user_chats",
-    "ensure_models", "run_agentic_rag", "get_rag_response", "check_rate_limit", "_short_hash_bytes_multiple"
-]
-
-# ---- END FILE: app_core.py ----
-
-
-# ---- FILE: app_ui.py (PART 2) ----
-# Streamlit UI that imports from app_core.py. Run this with: streamlit run app_ui.py
-
-import os
-import json
-import time
-import nest_asyncio
-import streamlit as st
-from app_core import *  # noqa: E402,F401
-
 
 def train_reranker_from_feedback():
     current_user = st.session_state.get("user_id")
@@ -905,33 +841,28 @@ def train_reranker_from_feedback():
         return
     train_reranker_incremental(current_user)
 
-
-def run_async(coro):
-    try:
-        return asyncio.run(coro)
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(coro)
-
-
 def main():
     nest_asyncio.apply()
     st.set_page_config(page_title="Agentic RAG Chatbot", layout="wide")
     st.title("Agentic RAG — Multi-PDF RAG with Active Learning & Streaming")
 
     if not GEMINI_API_KEY or not TAVILY_API_KEY:
-        st.error("API keys for Gemini or Tavily are not configured. Add GEMINI_API_KEY and TAVILY_API_KEY to your environment or Streamlit secrets.")
+        st.error("API keys for Gemini or Tavily are not configured.")
         st.stop()
 
-    # session defaults
-    st.session_state.setdefault("chat_history", [])
-    st.session_state.setdefault("feedback_examples", [])
-    st.session_state.setdefault("reranker_model", None)
-    st.session_state.setdefault("storage_root", STORAGE_ROOT)
-    st.session_state.setdefault("user_id", None)
-    st.session_state.setdefault("username", None)
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    if "feedback_examples" not in st.session_state:
+        st.session_state.feedback_examples = []
+    if "reranker_model" not in st.session_state:
+        st.session_state.reranker_model = None
+    if "storage_root" not in st.session_state:
+        st.session_state["storage_root"] = STORAGE_ROOT
+    if "user_id" not in st.session_state:
+        st.session_state["user_id"] = None
+    if "username" not in st.session_state:
+        st.session_state["username"] = None
 
-    # load persisted chats if user present
     if st.session_state.get("user_id") and not st.session_state.get("chat_history"):
         try:
             load_user_chats(st.session_state.get("user_id"))
@@ -964,6 +895,8 @@ def main():
                     ok, msg = load_user_reranker(uid)
                     if ok:
                         st.session_state["last_trained_reranker"] = st.session_state.get("loaded_reranker")
+                    else:
+                        pass
                 st.success("Logged in")
             else:
                 st.error("Login failed")
@@ -978,14 +911,12 @@ def main():
     sidebar.header("Controls")
     uploaded_files = sidebar.file_uploader("Upload PDF(s)", type="pdf", accept_multiple_files=True)
     if sidebar.button("Clear Chat History"):
-        st.session_state["chat_history"] = []
+        st.session_state.chat_history = []
     if sidebar.button("Clear Feedback"):
-        st.session_state["feedback_examples"] = []
-
+        st.session_state.feedback_examples = []
     save_path = sidebar.text_input("Model save dir", value="/tmp")
     st.session_state["reranker_path"] = save_path
 
-    # Reranker UI
     sidebar.markdown("---")
     sidebar.subheader("Reranker model management")
     if SKLEARN_AVAILABLE and joblib:
@@ -1027,7 +958,6 @@ def main():
     else:
         sidebar.info("scikit-learn / joblib not available in this environment. Model upload / load disabled.")
 
-    # Manual feedback expander
     with sidebar.expander("Manual feedback (paste snippet + label)"):
         manual_question = st.text_input("Question (optional)", key="manual_feedback_question")
         manual_snippet = st.text_area("Snippet text", key="manual_feedback_snippet", height=150)
@@ -1061,7 +991,6 @@ def main():
                 else:
                     st.info("Install scikit-learn to enable retrainer training")
 
-    # feedback count
     fb_rows = 0
     try:
         if st.session_state.get("user_id"):
@@ -1072,7 +1001,6 @@ def main():
         fb_rows = len(st.session_state.get("feedback_examples", []))
     sidebar.markdown(f"**Feedback examples:** {fb_rows}")
 
-    # ColPali controls
     sidebar.markdown("---")
     colpali_enabled = sidebar.checkbox("Enable ColPali/ColQwen hybrid rerank (experimental)", value=False)
     colpali_model = sidebar.selectbox("Col model", [
@@ -1094,7 +1022,6 @@ def main():
     else:
         sidebar.info("Install scikit-learn to enable reranker training")
 
-    # handle uploaded files
     docs = []
     if uploaded_files:
         files_list = uploaded_files if isinstance(uploaded_files, list) else [uploaded_files]
@@ -1115,12 +1042,15 @@ def main():
                 st.error(f"Failed to save {f.name}: {e}")
         sidebar.success(f"{saved_count} file(s) processed")
 
-    # Build ColPali index if requested
     if colpali_enabled and docs:
         try:
             current_user = st.session_state.get("user_id") or 0
             file_hash_preview = _short_hash_bytes_multiple(docs)
-            cfg = {"enabled": True, "model_name": colpali_model, "index": None}
+            cfg = {
+                "enabled": True,
+                "model_name": colpali_model,
+                "index": None,
+            }
             index = ColpaliIndex(colpali_model, current_user, file_hash_preview)
             ok = index.ensure_page_embeddings(docs)
             if ok:
@@ -1178,7 +1108,7 @@ def main():
                     with st.spinner("Thinking..."):
                         llm, embeddings_model = ensure_models()
                         if "rag_app" not in st.session_state:
-                            st.session_state["rag_app"] = run_agentic_rag()
+                            st.session_state["rag_app"] = rag_app_compiled
                         rag_app = st.session_state["rag_app"]
                         file_hash = _short_hash_bytes_multiple(docs) if docs else _short_hash_bytes(b"no-doc")
                         initial_state = {
@@ -1192,15 +1122,13 @@ def main():
                         st.session_state["last_file_hash"] = file_hash
                         persist_chat(current_user, "user", user_query)
                         try:
-                            final_state = run_async(get_rag_response(rag_app, initial_state))
+                            final_state = asyncio.get_event_loop().run_until_complete(get_rag_response(rag_app, initial_state))
                             answer = final_state.get("answer", "No answer was generated.")
                             retrieved = final_state.get("retrieved_docs", [])
                             confidence = final_state.get("confidence", 0.0)
-
                             st.markdown("## Answer")
                             st.write(answer)
                             st.markdown(f"**Confidence:** {confidence:.2f}")
-
                             st.markdown("### Best retrieved snippet (provenance shown). Label it to improve the reranker.")
                             if retrieved:
                                 best = retrieved[0]
@@ -1261,7 +1189,66 @@ def main():
                                     else:
                                         st.info("Install scikit-learn to enable reranker training")
 
-                                # other snippets quick label omitted for brevity in UI; full behavior preserved
+                                if len(retrieved) > 1:
+                                    st.markdown("---")
+                                    st.markdown("### Other retrieved snippets — quick label")
+                                    for idx, s in enumerate(retrieved[1:6], start=2):
+                                        meta = s.get("metadata", {})
+                                        fname = meta.get("filename", "unknown")
+                                        pnum = meta.get("page", "?")
+                                        chunk_idx = meta.get("chunk_index", 0)
+                                        st.markdown(f"**#{idx}** Source: {fname} (p.{pnum}) chunk {chunk_idx}")
+                                        txt = s.get("text", "")[:2000]
+                                        st.write(txt)
+                                        qh = abs(hash(user_query)) if user_query else 0
+                                        rel_k = f"rel_{file_hash_short}_{chunk_idx}_{qh}"
+                                        notrel_k = f"notrel_{file_hash_short}_{chunk_idx}_{qh}"
+                                        b1, b2 = st.columns([1, 1])
+                                        if b1.button("Relevant", key=rel_k):
+                                            cur = _db_conn.cursor()
+                                            cur.execute(
+                                                "INSERT INTO feedback (user_id, question, snippet, label, ts) VALUES (?, ?, ?, ?, ?)",
+                                                (current_user, user_query, txt, 1, time.time()),
+                                            )
+                                            _db_conn.commit()
+                                            st.success("Saved relevant feedback.")
+                                            st.session_state.setdefault("feedback_examples", []).append({
+                                                "user_id": current_user,
+                                                "question": user_query,
+                                                "snippet": txt,
+                                                "label": 1,
+                                                "ts": time.time(),
+                                            })
+                                            if SKLEARN_AVAILABLE:
+                                                try:
+                                                    train_reranker_incremental(current_user)
+                                                except Exception as e:
+                                                    st.warning(f"Retrainer failed: {e}")
+                                            else:
+                                                st.info("Install scikit-learn to enable reranker training")
+                                        if b2.button("Not relevant", key=notrel_k):
+                                            cur = _db_conn.cursor()
+                                            cur.execute(
+                                                "INSERT INTO feedback (user_id, question, snippet, label, ts) VALUES (?, ?, ?, ?, ?)",
+                                                (current_user, user_query, txt, 0, time.time()),
+                                            )
+                                            _db_conn.commit()
+                                            st.success("Saved not-relevant feedback.")
+                                            st.session_state.setdefault("feedback_examples", []).append({
+                                                "user_id": current_user,
+                                                "question": user_query,
+                                                "snippet": txt,
+                                                "label": 0,
+                                                "ts": time.time(),
+                                            })
+                                            if SKLEARN_AVAILABLE:
+                                                try:
+                                                    train_reranker_incremental(current_user)
+                                                except Exception as e:
+                                                    st.warning(f"Retrainer failed: {e}")
+                                            else:
+                                                st.info("Install scikit-learn to enable reranker training")
+
                             else:
                                 st.info("No retrieved snippets to display. Consider uploading PDFs or widening your search query.")
 
@@ -1285,7 +1272,7 @@ def main():
                 with st.spinner("Summarizing documents..."):
                     llm, embeddings_model = ensure_models()
                     if "rag_app" not in st.session_state:
-                        st.session_state["rag_app"] = run_agentic_rag()
+                        st.session_state["rag_app"] = rag_app_compiled
                     rag_app = st.session_state["rag_app"]
                     file_hash = _short_hash_bytes_multiple(docs)
                     initial_state = {
@@ -1299,7 +1286,7 @@ def main():
                     st.session_state["last_file_hash"] = file_hash
                     persist_chat(current_user, "user", "summarize")
                     try:
-                        final_state = run_async(get_rag_response(rag_app, initial_state))
+                        final_state = asyncio.get_event_loop().run_until_complete(get_rag_response(rag_app, initial_state))
                         answer = final_state.get("answer", "No summary generated.")
                         st.markdown("## Document Summary")
                         st.write(answer)
@@ -1310,5 +1297,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# ---- END FILE: app_ui.py ----
