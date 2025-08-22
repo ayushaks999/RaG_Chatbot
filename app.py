@@ -18,7 +18,6 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 import asyncio
 import nest_asyncio
-from dotenv import load_dotenv
 import numpy as np
 import time
 
