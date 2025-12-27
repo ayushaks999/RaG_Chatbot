@@ -2,15 +2,21 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) ![Python](https://img.shields.io/badge/python-3.8%2B-orange) ![Streamlit](https://img.shields.io/badge/streamlit-%3E%3D1.20-%23FF4B4B) ![LLM](https://img.shields.io/badge/LLM-RAG-blueviolet) ![Status](https://img.shields.io/badge/status-production--ready-success)
 
+> **Agentic RAG** is a **production-ready Retrieval-Augmented Generation (RAG) platform** built with **Streamlit**. It supports **multi‑PDF ingestion**, **multi‑user authentication**, **active learning via feedback → incremental reranker training**, **hybrid ColPali/ColQwen visual reranking**, **persistent storage**, and **streaming LLM responses**.
+
+---
+
+<!-- --- PROMINENT VIDEO DEMO BADGE --- -->
+
+# 🎥 **LIVE DEMO — WATCH THE VIDEO**
+
 <p align="center">
   <a href="https://drive.google.com/file/d/1CkHzVcIQQrCE1JeM5Q8hdNra_4XG9uGm/view?usp=sharing" target="_blank">
-    <img src="https://img.shields.io/badge/🎥%20WATCH%20VIDEO%20DEMO-Google%20Drive-brightgreen" alt="Video Demo" />
+    <img alt="Watch Live Demo" src="https://img.shields.io/badge/▶️%20LIVE%20DEMO-Click%20to%20Watch-red?style=for-the-badge&logo=google-drive" />
   </a>
 </p>
 
-<p align="center"><strong>⬆️ Click the badge above to watch the full end‑to‑end demo video</strong></p>
-
-> **Agentic RAG** is a **production-ready Retrieval-Augmented Generation (RAG) platform** built with **Streamlit**. It supports **multi‑PDF ingestion**, **multi‑user authentication**, **active learning via feedback → incremental reranker training**, **hybrid ColPali/ColQwen visual reranking**, **persistent storage**, and **streaming LLM responses**.
+> **(Click the big badge above to open the recorded live demo instantly.)**
 
 ---
 
@@ -28,8 +34,8 @@
 * [ColPali/ColQwen Hybrid Rerank (Experimental)](#-colpalicolqwen-hybrid-rerank-experimental)
 * [Security & Operations](#-security--operations)
 * [UI Overview](#-ui-overview)
-* [Screenshots](#-screenshots)
 * [Troubleshooting](#-troubleshooting)
+* [Screenshots](#-screenshots)
 * [Roadmap](#-roadmap)
 * [Contributing](#-contributing)
 * [License](#-license)
@@ -50,25 +56,67 @@
 
 ## ✨ Feature Highlights
 
+### Authentication & Persistence
+
 * Register/login (SQLite `users` table), PBKDF2‑SHA256 with per‑user salt.
 * Persisted chats (`chats`) and feedback (`feedback`) per user.
 * Per‑user file registry (`files`) with sanitized, content-hash filenames.
-* Multi‑PDF upload with OCR fallback (Tesseract + pytesseract if available).
-* Chroma vector store, Gemini embeddings by default.
-* Two-stage reranker + optional ColPali/ColQwen hybrid visual rerank.
-* Streaming LLM responses and provenance.
+
+### Uploads & Ingestion
+
+* Multi‑PDF upload via sidebar.
+* Size guard via `AGENTIC_RAG_MAX_UPLOAD_BYTES` (default **10 MB**).
+* Parsing with **PyPDF2**; OCR fallback (if **Tesseract + pytesseract** present).
+* Token‑aware chunking via **tiktoken** (fallback to character chunking).
+
+### Vector Index & Retrieval
+
+* **Chroma** vector store, per user + file‑hash cache, optional disk persistence under `STORAGE_ROOT`.
+* Embeddings via **GoogleGenerativeAIEmbeddings (Gemini)** (easily swappable).
+* Configurable top‑k retrieval.
+
+### Reranking & Active Learning
+
+* Two-stage rerank:
+
+  1. **Learned reranker** (SGDClassifier) trained incrementally on feedback (embeddings cached).
+  2. **Hybrid visual rerank** (ColPali/ColQwen page-image embeddings) blending ~70% image sim + 30% text score.
+* Inline **Relevant / Not Relevant** feedback buttons persist labels and can trigger training.
+
+### LLM Orchestration & Scoring
+
+* Primary LLM: **ChatGoogleGenerativeAI (Gemini)**; embeddings via **GoogleGenerativeAIEmbeddings**.
+* **score_snippets → evaluate → generate** pipeline with confidence gating.
+* Streaming answers (where LLM supports) or chunked reveal fallback.
+
+### Web Search Fallback
+
+* Optional **Tavily** integration (`TAVILY_API_KEY`) when evaluation confidence is low.
 
 ---
 
-## 🖼 Screenshots (only **Rag_Chat1** — shown below)
+## 🧱 Architecture
 
-> The README now embeds a single screenshot: `Screenshots/Rag_Chat1.png`. Make sure this file path exists in your repository.
+```mermaid
+flowchart TD
+  A[Start: initialize_models] --> B[load_and_chunk_docs]
+  B --> C[create_chroma_index]
+  C --> D[retrieve]
+  D -->|summarize| M[summarize_docs]
+  D -->|else| E[rerank]
+  E --> F[score_snippets]
+  F --> G[evaluate_confidence]
+  G -->|>=0.6| H[generate_answer]
+  G -->|<0.6| I[web_search]
+  I --> H
+  H --> Z[END]
+  M --> Z
 
-<p align="center">
-  <img src="Screenshots/Rag_Chat1.png" alt="RAG Chat - Rag_Chat1" style="max-width:900px; width:90%;" />
-</p>
-
-*Caption:* Main chat pane — conversation, snippet provenance, and feedback controls.
+  subgraph Optional
+    I2[ColPali/ColQwen image rerank] --> E
+    J[Feedback-based incremental reranker] --> E
+  end
+```
 
 ---
 
@@ -76,11 +124,19 @@
 
 * **Python 3.8+**
 * **Gemini API key** for default LLM & embeddings
-* Optional extras: `pytesseract` + Tesseract, `torch`, `pdf2image`, `scikit-learn`, `joblib`, `tiktoken`
+* Optional extras:
+
+  * `pytesseract` + **Tesseract** binary for OCR
+  * `torch`, `pdf2image`, `colpali_engine` for ColPali/ColQwen image embeddings (GPU recommended)
+  * `scikit-learn` + `joblib` for reranker training
+  * `tiktoken` for token‑accurate chunking
+  * **Tavily API key** for web search fallback
 
 ---
 
 ## ⚙ Environment Variables / `.env`
+
+Create a `.env` (or set env vars) with at least:
 
 ```env
 GEMINI_API_KEY=your_gemini_key_here
@@ -91,19 +147,24 @@ AGENTIC_RAG_MAX_UPLOAD_BYTES=10485760   # default 10 MB
 AGENTIC_RAG_RATE_LIMIT_N=30
 ```
 
+> The app also reads `st.secrets` if present.
+
 ---
 
 ## 💻 Installation
 
 ```bash
-# create and activate venv
+# 1) Create and activate a virtual environment
 python -m venv .venv
-# mac/linux
-# source .venv/bin/activate
-# windows
-# .venv/Scripts/activate
+# mac/linux	 source .venv/bin/activate
+# windows	.venv\Scripts\activate
 
+# 2) Install dependencies
 pip install -r requirements.txt
+# or install core deps manually
+pip install streamlit PyPDF2 chromadb google-generativeai langgraph langchain-community
+# optional extras
+pip install scikit-learn joblib tiktoken pytesseract pdf2image torch
 ```
 
 ---
@@ -114,58 +175,130 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Open the URL shown in your terminal (usually `http://localhost:8501`).
+Then open the URL shown in your terminal (usually `http://localhost:8501`).
 
 ---
 
 ## 🧭 Quickstart Workflow
 
-1. Start the app with `streamlit run app.py`.
-2. Register / Login via the sidebar.
-3. Upload PDFs.
-4. Ask a question or Summarize documents.
-5. Provide snippet feedback and train the reranker to improve relevance.
+1. **Start** the app: `streamlit run app.py`.
+2. **Register** an account (sidebar) and **Login**.
+3. **Upload** one or more PDFs.
+4. **Ask** a question (or click **Summarize documents**).
+5. **Read** the streamed answer + provenance (filename / page / chunk).
+6. **Label** snippets (Relevant / Not Relevant).
+7. **Train** the reranker from feedback (sidebar button) and improve results.
 
 ---
 
 ## 🔁 Incremental Reranker Training
 
-Feedback rows are stored per user; call `train_reranker_incremental(user_id)` or use the sidebar control to `partial_fit` an SGDClassifier and persist models under `STORAGE_ROOT/user_<id>/models/`.
+* Feedback rows are stored per user in the `feedback` table.
+* `train_reranker_incremental(user_id)` will:
+
+  1. Load feedback rows for the user.
+  2. Embed snippet texts (cached under `STORAGE_ROOT/user_<id>/emb_cache/<file_hash>`).
+  3. Train or `partial_fit` an **SGDClassifier** (log loss) and persist models under `user_<id>/models/` (timestamped + `reranker_sgd.joblib`).
+* The UI exposes **Train reranker from feedback** to trigger this.
+
+---
+
+## 🖼 ColPali/ColQwen Hybrid Rerank (Experimental)
+
+* With `colpali_engine` + `torch` + `pdf2image` installed, the app computes page‑image embeddings and caches them per file + user.
+* Hybrid score: **70% image similarity + 30% text score** (configurable) to boost diagram/table‑heavy pages.
+* Toggle **Enable ColPali/ColQwen hybrid rerank** in the sidebar.
 
 ---
 
 ## 🔒 Security & Operations
 
-* PBKDF2 password hashing, sanitized filenames, confined writes under `STORAGE_ROOT`.
-* Rate limiting and basic input sanitization.
-* For production: reverse proxy (nginx), TLS, and volume protection.
+* Passwords hashed with **PBKDF2** + per‑user salt (200,000 iterations).
+* Filenames sanitized; all writes confined under `STORAGE_ROOT`.
+* **Rate limiting** per minute via `AGENTIC_RAG_RATE_LIMIT_N`.
+* For public deployments: put Streamlit behind a **reverse proxy**, enable **TLS**, protect the DB volume, and consider **OAuth**.
+
+---
+
+## 🧭 UI Overview
+
+**Sidebar**
+
+* Register / Login
+* Upload PDFs (multi)
+* Model save directory
+* Reranker: upload / load / delete
+* Manual feedback expander (paste snippet + label)
+* Enable ColPali/ColQwen hybrid rerank
+* Train reranker from feedback
+* Summarize documents
+
+**Main Pane**
+
+* Chat history, exports, last trained reranker download
+* Question input + **Get Answer**
+* Streamed answer + provenance
+* Feedback buttons per snippet
 
 ---
 
 ## 🧪 Troubleshooting
 
-* Missing LLM key → set `GEMINI_API_KEY` and restart Streamlit.
-* Chroma issues → verify `AGENTIC_RAG_STORAGE` permissions.
-* OCR failures → install Tesseract and `pytesseract`.
+* **LLM API key missing** → set `GEMINI_API_KEY` in `.env` or `st.secrets` and restart.
+* **Chroma errors** → verify install and file permissions for `AGENTIC_RAG_STORAGE`.
+* **Reranker not training** → ensure `scikit-learn` + `joblib` are installed and `feedback` has rows.
+* **OCR not working** → install **Tesseract** and `pytesseract`; ensure `pdf2image` is present.
+* **ColPali failures** → requires `torch`, `pdf2image`, and `colpali_engine`; GPU strongly recommended.
+
+---
+
+## 📸 Screenshots
+
+> The screenshots are included from the `Screenshots/` directory in this repo. Add any missing screenshots to that folder (e.g. `Rag_Chat1.png`, `Rag_Chat2.png`, `Login.png`, `Reranker.png`, `Summarization.png`) so they display here.
+
+### Rag Chat — Main Chat View (Rag_Chat1)
+
+![RAG Chat 1](Screenshots/Rag_Chat1.png)
+
+### Rag Chat — Alternate / Streaming View (Rag_Chat2)
+
+![RAG Chat 2](Screenshots/Rag_Chat2.png)
+
+### Login Screen
+
+![Login](Screenshots/Login.png)
+
+### Reranker / Feedback UI
+
+![Reranker](Screenshots/Reranker.png)
+
+### Summarization / Results
+
+![Summarization](Screenshots/Summarization.png)
+
+> **Note:** Ensure the images are uploaded under `Screenshots/` with exact filenames above so GitHub displays them inline.
 
 ---
 
 ## 🗺 Roadmap
 
-* Split `app.py` into packages, add OAuth, unit tests, k8s manifests, and usage analytics.
+* Extract `app.py` into modular packages (`ingest`, `indexing`, `auth`, `ui`).
+* OAuth2 / Google sign‑in for production deployments.
+* Unit tests for DB migrations and graph node functions.
+* Helm chart / k8s manifests for scalable deployments.
+* Add configurable reranker blends and UI analytics.
 
 ---
 
 ## 🤝 Contributing
 
-Contributions welcome — open an issue or PR with clear steps to reproduce.
+Contributions welcome! Please open an issue or PR with a clear description and repro steps.
 
 ---
 
 ## 📝 License
 
-MIT — see `LICENSE`.
+This project is provided under the **MIT License**. See [`LICENSE`](LICENSE) for details.
 
 ---
 
-*Notes:* If `Screenshots/Rag_Chat1.png` has a different filename or path, update the image path in this README. The canvas now contains the full, updated README with only the requested screenshot embedded.
