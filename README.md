@@ -264,9 +264,6 @@ Then open the URL shown in your terminal (usually `http://localhost:8501`).
 
 ![RAG Chat 1](Chat_1.png)
 
-### Rag Chat — Alternate / Streaming View
-
-![RAG Chat 2](Chat_2.png)
 
 ### Login Screen
 
