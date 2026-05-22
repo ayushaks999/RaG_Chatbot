@@ -254,29 +254,29 @@ Then open the URL shown in your terminal (usually `http://localhost:8501`).
 
 ## 📸 Screenshots
 
-> The screenshots are included from the `Screenshots/` directory in this repo. Add any missing screenshots to that folder (e.g. `Rag_Chat1.png`, `Rag_Chat2.png`, `Login.png`, `Reranker.png`, `Summarization.png`) so they display here.
+> The screenshots are included directly from the root of the `main` branch in this repository.
 
-### Rag Chat — Main Chat View (Rag_Chat1)
+### Azure Deployment / Cloud Setup
 
-![RAG Chat 1](Screenshots/Rag_Chat1.png)
+![Azure Deployment](Azure.png)
 
-### Rag Chat — Alternate / Streaming View (Rag_Chat2)
+### Rag Chat — Main Chat View
 
-![RAG Chat 2](Screenshots/Rag_Chat2.png)
+![RAG Chat 1](Chat_1.png)
+
+### Rag Chat — Alternate / Streaming View
+
+![RAG Chat 2](Chat_2.png)
 
 ### Login Screen
 
-![Login](Screenshots/Login.png)
+![Login](Login.png)
 
 ### Reranker / Feedback UI
 
-![Reranker](Screenshots/Reranker.png)
+![Reranker](Reranker.png)
 
-### Summarization / Results
-
-![Summarization](Screenshots/Summarization.png)
-
-> **Note:** Ensure the images are uploaded under `Screenshots/` with exact filenames above so GitHub displays them inline.
+> **Note:** These images are stored in the root directory of the repository, not inside the old `Screenshots/` folder.
 
 ---
 
